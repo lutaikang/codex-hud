@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Codex / HUD runtime
+.codex-hud/
+*.lock
+*.ready
+*.exit
+*.detached
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/projects/
