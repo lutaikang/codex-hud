@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Render the active Codex session into a small tmux pane."""
+"""Render the active Codex session into a small HUD surface."""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
+import termios
 import threading
 import time
 import unicodedata
@@ -34,6 +38,8 @@ COLORS = {
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 GIT_CACHE_SECONDS = 5.0
 _GIT_CACHE: dict[str, tuple[float, str]] = {}
+ACCOUNT_REFRESH_SECONDS = 60.0
+ACCOUNT_READ_TIMEOUT = 4.0
 
 PRICES_PER_MILLION = {
     "gpt-5.6-sol": (5.0, 0.5, 30.0),
@@ -41,6 +47,42 @@ PRICES_PER_MILLION = {
     "gpt-5.6-terra": (2.5, 0.25, 15.0),
     "gpt-5.6-luna": (1.0, 0.1, 6.0),
 }
+
+
+def terminal_geometry(file_descriptor: int) -> dict[str, int]:
+    packed = fcntl.ioctl(file_descriptor, termios.TIOCGWINSZ, b"\0" * 8)
+    rows, columns, width_pixels, height_pixels = struct.unpack("HHHH", packed)
+    return {
+        "rows": rows,
+        "columns": columns,
+        "width_pixels": width_pixels,
+        "height_pixels": height_pixels,
+    }
+
+
+def _write_private_json(path: Path, value: dict[str, int]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"))
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _touch_private(path: Path) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
 
 
 def color(name: str, text: str) -> str:
@@ -196,7 +238,9 @@ class TranscriptScanner:
 
 
 class AccountReader:
-    def read(self, timeout: float = 4.0) -> tuple[dict[str, Any], dict[str, Any]]:
+    def read(
+        self, timeout: float = ACCOUNT_READ_TIMEOUT
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
             process = subprocess.Popen(
                 ["codex", "app-server"],
@@ -227,9 +271,26 @@ class AccountReader:
             process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
             process.stdin.flush()
 
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + max(0.05, timeout)
         account: dict[str, Any] = {}
         limits: dict[str, Any] = {}
+
+        def receive(expected_id: int) -> dict[str, Any] | None:
+            """Return the first response for an id, including JSON-RPC errors."""
+            while time.monotonic() < deadline:
+                remaining = max(0.01, deadline - time.monotonic())
+                try:
+                    message = messages.get(timeout=min(0.05, remaining))
+                except queue.Empty:
+                    # A failed app-server can exit without writing a response.
+                    # Do not turn that into a full timeout on every refresh.
+                    if process.poll() is not None:
+                        return None
+                    continue
+                if message.get("id") == expected_id:
+                    return message
+            return None
+
         try:
             send(
                 {
@@ -244,11 +305,8 @@ class AccountReader:
                     },
                 }
             )
-            while time.monotonic() < deadline:
-                message = messages.get(timeout=max(0.05, deadline - time.monotonic()))
-                if message.get("id") == 0:
-                    break
-            else:
+            initialize = receive(0)
+            if initialize is None or "error" in initialize:
                 return account, limits
             send({"method": "initialized", "params": {}})
             send(
@@ -258,22 +316,26 @@ class AccountReader:
                     "params": {"refreshToken": False},
                 }
             )
-            send({"method": "account/rateLimits/read", "id": 2})
-            pending = {1, 2}
-            while pending and time.monotonic() < deadline:
-                try:
-                    message = messages.get(timeout=max(0.05, deadline - time.monotonic()))
-                except queue.Empty:
-                    break
-                message_id = message.get("id")
-                result = message.get("result")
-                if message_id == 1 and isinstance(result, dict):
+            account_response = receive(1)
+            if account_response is not None:
+                result = account_response.get("result")
+                if isinstance(result, dict):
                     value = result.get("account")
                     account = value if isinstance(value, dict) else {}
-                    pending.discard(1)
-                elif message_id == 2 and isinstance(result, dict):
-                    limits = result
-                    pending.discard(2)
+
+            # API-key sessions do not expose Codex subscription rate limits;
+            # avoid issuing a request that the server will reject.  The
+            # transcript remains the source of any rolling limit data.
+            if str(account.get("type") or "").lower() not in {
+                "apikey",
+                "api_key",
+            }:
+                send({"method": "account/rateLimits/read", "id": 2})
+                limits_response = receive(2)
+                if limits_response is not None:
+                    result = limits_response.get("result")
+                    if isinstance(result, dict):
+                        limits = result
         except (BrokenPipeError, OSError, queue.Empty):
             pass
         finally:
@@ -293,8 +355,66 @@ class AccountReader:
         return account, limits
 
 
-def account_label(account: dict[str, Any]) -> str:
+class AccountPoller:
+    """Refresh account metadata without delaying the first HUD frame."""
+
+    def __init__(
+        self,
+        reader: AccountReader | None = None,
+        refresh_seconds: float = ACCOUNT_REFRESH_SECONDS,
+    ) -> None:
+        self.reader = reader or AccountReader()
+        self.refresh_seconds = max(1.0, float(refresh_seconds))
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._account: dict[str, Any] = {}
+        self._limits: dict[str, Any] = {}
+        self._loaded = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="codex-hud-account-refresh",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                account, limits = self.reader.read()
+            except Exception:
+                account, limits = {}, {}
+            with self._lock:
+                self._account = account if isinstance(account, dict) else {}
+                self._limits = limits if isinstance(limits, dict) else {}
+                self._loaded = True
+            if self._stop.wait(self.refresh_seconds):
+                return
+
+    def snapshot(self) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        with self._lock:
+            return dict(self._account), dict(self._limits), self._loaded
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
+
+
+def account_label(account: dict[str, Any], loading: bool = False) -> str:
+    if loading and not account:
+        return "loading"
     account_type = str(account.get("type") or "unknown")
+    normalized_type = account_type.lower().replace("_", "")
+    if normalized_type == "apikey":
+        return "API key"
+    if normalized_type == "amazonbedrock":
+        return "Bedrock"
     email = account.get("email")
     plan = account.get("planType")
     if isinstance(email, str) and email:
@@ -302,6 +422,10 @@ def account_label(account: dict[str, Any]) -> str:
     else:
         identity = account_type
     return f"{identity}/{plan}" if plan else identity
+
+
+def is_api_account(account: dict[str, Any]) -> bool:
+    return str(account.get("type") or "").lower().replace("_", "") == "apikey"
 
 
 def git_label(cwd: str | None) -> str:
@@ -377,6 +501,7 @@ def render_lines(
     scanner: TranscriptScanner,
     account: dict[str, Any],
     limits: dict[str, Any],
+    account_loaded: bool = True,
 ) -> list[str]:
     now = time.time()
     model = scanner.model or state.get("model") or "model --"
@@ -386,8 +511,11 @@ def render_lines(
     project = Path(cwd).name if isinstance(cwd, str) and cwd else "project --"
     branch = git_label(cwd if isinstance(cwd, str) else None)
     duration = human_duration(now - float(state.get("started_at") or now))
+    api_account = is_api_account(account)
     cost = estimated_cost(str(model).split(" · ", 1)[0], scanner.total)
-    cost_label = f"Base Est.${cost:.2f}" if cost is not None else "Base Est.$--"
+    cost_label = (
+        f"API equiv.${cost:.2f}" if cost is not None else "API equiv.$--"
+    )
     status = str(state.get("status") or "starting")
     status_mark = color("yellow", "●") if status == "working" else color("green", "●")
     first = "  ".join(
@@ -395,10 +523,13 @@ def render_lines(
         for part in (
             f"{color('cyan', 'HUD')} v{HUD_VERSION} {status_mark} {status}",
             color("cyan", f"[{model}]"),
-            color("magenta", f"acct:{account_label(account)}"),
+            color(
+                "magenta",
+                f"acct:{account_label(account, loading=not account_loaded)}",
+            ),
             f"{project} {branch}".strip(),
             f"⏱ {duration}",
-            f"≈{cost_label.removeprefix('Base Est.')}",
+            f"≈{cost_label}",
         )
         if part
     )
@@ -438,6 +569,22 @@ def render_lines(
         f"{color('cyan', 'CACHE')} {cache_percent:.0f}% · "
         f"{human_tokens(cached_tokens)}/{human_tokens(input_tokens)}"
     )
+    if api_account:
+        if input_tokens or cached_tokens or scanner.total.get("output_tokens"):
+            uncached_tokens = max(0, input_tokens - cached_tokens)
+            output_tokens = int(scanner.total.get("output_tokens") or 0)
+            reasoning_tokens = int(
+                scanner.total.get("reasoning_output_tokens") or 0
+            )
+            third += (
+                f"  │  API in {human_tokens(uncached_tokens)} + "
+                f"cache {human_tokens(cached_tokens)} · "
+                f"out {human_tokens(output_tokens)}"
+            )
+            if reasoning_tokens:
+                third += f" · reasoning {human_tokens(reasoning_tokens)}"
+        else:
+            third += "  │  API usage --"
 
     active_tools = state.get("active_tools") if isinstance(state.get("active_tools"), dict) else {}
     tool_stats = state.get("tool_stats") if isinstance(state.get("tool_stats"), dict) else {}
@@ -568,33 +715,71 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--ready-file")
+    parser.add_argument("--geometry-file")
     args = parser.parse_args()
 
     scanner = TranscriptScanner()
-    account_reader = AccountReader()
-    account: dict[str, Any] = {}
-    limits: dict[str, Any] = {}
-    next_account_refresh = 0.0
+    account_poller = None if args.once else AccountPoller()
+    if account_poller is not None:
+        account_poller.start()
+    last_geometry: dict[str, int] | None = None
+    ready_written = False
+    first_frame = True
 
-    while enabled():
-        state = load_state(args.run_id)
-        scanner.scan(state.get("transcript_path"))
-        if time.monotonic() >= next_account_refresh:
-            account, limits = account_reader.read()
-            next_account_refresh = time.monotonic() + 60
-        lines = render_lines(state, scanner, account, limits)
-        width = max(1, shutil.get_terminal_size((120, HUD_LINES)).columns)
-        clipped = [visible_clip(line, width) for line in lines]
-        if args.once:
-            print("\n".join(clipped))
-            return 0
-        # Exactly HUD_LINES rows and no trailing newline: tmux does not scroll.
-        sys.stdout.write("\033[H\033[2J" + "\n".join(clipped))
-        sys.stdout.flush()
-        if state.get("status") == "ended":
-            return 0
-        time.sleep(1)
-    return 0
+    try:
+        while enabled():
+            state = load_state(args.run_id)
+            # The launcher needs only a minimal first frame to open the split.
+            # Defer a potentially large transcript scan until the HUD is
+            # visible; --once remains a complete synchronous snapshot mode.
+            if args.once or not first_frame:
+                scanner.scan(state.get("transcript_path"))
+            if account_poller is not None:
+                account, limits, account_loaded = account_poller.snapshot()
+            else:
+                account, limits, account_loaded = {}, {}, False
+            lines = render_lines(
+                state,
+                scanner,
+                account,
+                limits,
+                account_loaded=account_loaded,
+            )
+            try:
+                geometry = terminal_geometry(sys.stdout.fileno())
+            except (OSError, ValueError):
+                geometry = {
+                    "rows": HUD_LINES,
+                    "columns": shutil.get_terminal_size((120, HUD_LINES)).columns,
+                    "width_pixels": 0,
+                    "height_pixels": 0,
+                }
+            if args.geometry_file and geometry != last_geometry:
+                _write_private_json(Path(args.geometry_file), geometry)
+                last_geometry = geometry
+            width = max(1, geometry["columns"])
+            clipped = [visible_clip(line, width) for line in lines]
+            if args.once:
+                print("\n".join(clipped))
+                if args.ready_file:
+                    _touch_private(Path(args.ready_file))
+                return 0
+            # Exactly HUD_LINES rows and no trailing newline: the HUD does not scroll.
+            sys.stdout.write("\033[H\033[2J" + "\n".join(clipped))
+            sys.stdout.flush()
+            if args.ready_file and not ready_written:
+                _touch_private(Path(args.ready_file))
+                ready_written = True
+            if state.get("status") == "ended":
+                return 0
+            delay = 0.1 if first_frame else 1.0
+            first_frame = False
+            time.sleep(delay)
+        return 0
+    finally:
+        if account_poller is not None:
+            account_poller.stop()
 
 
 if __name__ == "__main__":

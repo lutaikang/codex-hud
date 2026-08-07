@@ -1,24 +1,40 @@
 #!/usr/bin/env python3
-"""Enable, disable, and launch Codex with a local tmux HUD."""
+"""Enable, disable, and launch Codex with a local eight-line HUD."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from hud_state import enabled, hud_home, mark_ended, remove_run, set_enabled, HUD_LINES
+from tmux_mouse import (
+    acquire_tmux_mouse as _acquire_tmux_mouse,
+    acquire_native_mouse as _acquire_native_mouse,
+    release_native_mouse as _release_native_mouse,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RENDERER = SCRIPT_DIR / "hud_render.py"
+TMUX_SOCKET = os.environ.get("CODEX_HUD_TMUX_SOCKET", "codex-hud")
+GHOSTTY_APPLICATION_ID = "com.mitchellh.ghostty"
+NATIVE_HUD_READY_TIMEOUT = 10.0
+NATIVE_HUD_RESIZE_TIMEOUT = 8.0
+NATIVE_HUD_APPLESCRIPT_TIMEOUT = 15.0
+NATIVE_HUD_RESIZE_ACTION_TIMEOUT = 3.0
+_GHOSTTY_SCRIPT_LOCK = threading.RLock()
 
 
 def _best_effort(action: object, *arguments: object, **keywords: object) -> None:
@@ -27,6 +43,14 @@ def _best_effort(action: object, *arguments: object, **keywords: object) -> None
     except Exception:
         # Cleanup must continue even if local telemetry or tmux already vanished.
         pass
+
+
+def _tmux(arguments: list[str], socket_name: str | None = None) -> list[str]:
+    command = ["tmux"]
+    if socket_name:
+        command.extend(["-L", socket_name])
+    command.extend(arguments)
+    return command
 
 
 def _mark_ended(run_id: str) -> None:
@@ -41,20 +65,24 @@ def _unlink(path: Path) -> None:
     _best_effort(path.unlink, missing_ok=True)
 
 
-def _kill_tmux(target_type: str, target: str) -> None:
+def _kill_tmux(
+    target_type: str, target: str, socket_name: str | None = None
+) -> None:
     _best_effort(
         subprocess.run,
-        ["tmux", f"kill-{target_type}", "-t", target],
+        _tmux([f"kill-{target_type}", "-t", target], socket_name),
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
 
-def _tmux_session_exists(session_name: str) -> bool:
+def _tmux_session_exists(
+    session_name: str, socket_name: str | None = None
+) -> bool:
     try:
         result = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
+            _tmux(["has-session", "-t", session_name], socket_name),
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -88,16 +116,534 @@ def _command_text(arguments: list[str]) -> str:
     return shlex.join(arguments)
 
 
+def _install_termination_handlers() -> dict[int, object]:
+    """Turn common termination signals into Python cleanup paths."""
+    previous: dict[int, object] = {}
+
+    def terminate(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, terminate)
+    return previous
+
+
+def _restore_termination_handlers(previous: dict[int, object]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)  # type: ignore[arg-type]
+
+
+def _suspend_termination_handlers() -> None:
+    """Prevent a second TERM/HUP from interrupting the cleanup finally block."""
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, signal.SIG_IGN)
+
+
+def _codex_arguments(arguments: list[str]) -> list[str]:
+    """Use Codex inline mode so the owning terminal retains transcript scrollback."""
+    if "--no-alt-screen" in arguments:
+        return list(arguments)
+    return ["--no-alt-screen", *arguments]
+
+
+def _native_terminal_mouse(environment: dict[str, str]) -> bool:
+    return sys.platform == "darwin" and environment.get("TERM_PROGRAM") == "ghostty"
+
+
+def _native_ghostty_hud(environment: dict[str, str]) -> bool:
+    if environment.get("TMUX") or not _native_terminal_mouse(environment):
+        return False
+    try:
+        return os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())
+    except (AttributeError, OSError):
+        return False
+
+
+def _applescript_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return f'"{escaped}"'
+
+
+def _run_applescript(
+    script: str, timeout: float = NATIVE_HUD_APPLESCRIPT_TIMEOUT
+) -> str:
+    with _GHOSTTY_SCRIPT_LOCK:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(message)
+    return result.stdout.strip()
+
+
+def _ghostty_environment(environment: dict[str, str]) -> list[str]:
+    values: list[str] = []
+    for key in ("CODEX_HOME", "CODEX_HUD_HOME", "PATH", "NO_COLOR"):
+        value = environment.get(key)
+        if value is not None:
+            values.append(f"{key}={value}")
+    return values
+
+
+def _ghostty_working_directory_uri(path: str | Path) -> str:
+    absolute = str(Path(path).expanduser().resolve())
+    return f"file://localhost{quote(absolute, safe='/')}"
+
+
+def _ghostty_set_reported_working_directory(path: str | Path) -> bool:
+    try:
+        descriptor = sys.stdout.fileno()
+    except (AttributeError, OSError):
+        return False
+    if not os.isatty(descriptor):
+        return False
+    sys.stdout.write(f"\033]7;{_ghostty_working_directory_uri(path)}\a")
+    sys.stdout.flush()
+    return True
+
+
+def _ghostty_open_hud(
+    hud_command: str,
+    environment: dict[str, str],
+    working_directory: str,
+    target_directory: Path,
+    hud_directory: Path | None = None,
+) -> tuple[str, str, float]:
+    environment_values = ", ".join(
+        _applescript_string(value) for value in _ghostty_environment(environment)
+    )
+    target_directory = target_directory.expanduser().resolve()
+    target_command = (
+        "set mainTerminal to first terminal whose working directory is "
+        + _applescript_string(str(target_directory))
+    )
+    if hud_directory is None:
+        hud_directory = Path(working_directory).expanduser().resolve()
+    else:
+        hud_directory = hud_directory.expanduser().resolve()
+    script = "\n".join(
+        [
+            'use framework "AppKit"',
+            "set scaleFactor to 1.0",
+            "try",
+            "repeat with screen in (current application's NSScreen's screens())",
+            "set candidateScale to (screen's backingScaleFactor()) as real",
+            "if candidateScale > scaleFactor then set scaleFactor to candidateScale",
+            "end repeat",
+            "end try",
+            f'tell application id "{GHOSTTY_APPLICATION_ID}"',
+            target_command,
+            "set hudConfiguration to new surface configuration",
+            f"set command of hudConfiguration to {_applescript_string(hud_command)}",
+            f"set initial working directory of hudConfiguration to {_applescript_string(str(hud_directory))}",
+            "set wait after command of hudConfiguration to false",
+            f"set environment variables of hudConfiguration to {{{environment_values}}}",
+            "set hudTerminal to split mainTerminal direction down with configuration hudConfiguration",
+            'return ((id of mainTerminal) as text) & "|" & ((id of hudTerminal) as text) & "|" & (scaleFactor as text)',
+            "end tell",
+        ]
+    )
+    output = _run_applescript(script)
+    parts = output.split("|")
+    if len(parts) != 3 or not parts[0] or not parts[1]:
+        raise RuntimeError("Ghostty did not return native terminal identifiers")
+    try:
+        scale = float(parts[2])
+    except ValueError:
+        scale = 1.0
+    return parts[0], parts[1], max(1.0, scale)
+
+
+def _ghostty_make_readonly(terminal_id: str) -> None:
+    script = "\n".join(
+        [
+            f'tell application id "{GHOSTTY_APPLICATION_ID}"',
+            f"set hudTerminal to first terminal whose id is {_applescript_string(terminal_id)}",
+            'set readonlyOK to perform action "toggle_readonly" on hudTerminal',
+            'if readonlyOK is false then error "toggle_readonly was rejected"',
+            "end tell",
+        ]
+    )
+    _run_applescript(script, timeout=NATIVE_HUD_RESIZE_ACTION_TIMEOUT)
+
+
+def _ghostty_focus_terminal(terminal_id: str) -> None:
+    script = "\n".join(
+        [
+            f'tell application id "{GHOSTTY_APPLICATION_ID}"',
+            f"set mainTerminal to first terminal whose id is {_applescript_string(terminal_id)}",
+            "focus mainTerminal",
+            "end tell",
+        ]
+    )
+    _run_applescript(script, timeout=NATIVE_HUD_RESIZE_ACTION_TIMEOUT)
+
+
+def _ghostty_close_terminal(terminal_id: str) -> None:
+    script = "\n".join(
+        [
+            f'tell application id "{GHOSTTY_APPLICATION_ID}"',
+            f"set hudTerminal to first terminal whose id is {_applescript_string(terminal_id)}",
+            "close hudTerminal",
+            "end tell",
+        ]
+    )
+    _run_applescript(script, timeout=NATIVE_HUD_APPLESCRIPT_TIMEOUT)
+
+
+def _ghostty_close_terminal_by_working_directory(path: str | Path) -> None:
+    """Close a split whose terminal id was lost while opening it."""
+    directory = str(Path(path).expanduser().resolve())
+    script = "\n".join(
+        [
+            f'tell application id "{GHOSTTY_APPLICATION_ID}"',
+            f"set hudTerminals to every terminal whose working directory is {_applescript_string(directory)}",
+            "repeat with hudTerminal in hudTerminals",
+            "try",
+            "close hudTerminal",
+            "end try",
+            "end repeat",
+            "end tell",
+        ]
+    )
+    _run_applescript(script, timeout=NATIVE_HUD_APPLESCRIPT_TIMEOUT)
+
+
+def _close_native_hud(
+    terminal_id: str | None,
+    marker_directory: Path,
+    marker_cleanup_allowed: bool,
+) -> None:
+    """Close the exact HUD surface, recovering by its unique cwd if needed."""
+    if terminal_id:
+        try:
+            _ghostty_close_terminal(terminal_id)
+            return
+        except Exception:
+            # The ID can become invalid while Ghostty is closing or while an
+            # osascript request is interrupted.  The per-run cwd is the safe
+            # fallback because it is never shared with another surface.
+            pass
+    if marker_cleanup_allowed:
+        _best_effort(_ghostty_close_terminal_by_working_directory, marker_directory)
+
+
+def _read_terminal_geometry(path: Path) -> dict[str, int] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    geometry: dict[str, int] = {}
+    for key in ("rows", "columns", "width_pixels", "height_pixels"):
+        item = value.get(key)
+        if not isinstance(item, int) or item < 0:
+            return None
+        geometry[key] = item
+    return geometry
+
+
+def _ghostty_resize_action(
+    geometry: dict[str, int],
+    backing_scale: float,
+    target_lines: int = HUD_LINES,
+) -> str | None:
+    rows = geometry.get("rows", 0)
+    if rows <= 0 or rows == target_lines:
+        return None
+    height_pixels = geometry.get("height_pixels", 0)
+    if height_pixels > 0 and backing_scale > 0:
+        cell_height = height_pixels / backing_scale / rows
+    else:
+        cell_height = 18.0
+    amount = max(1, round(abs(rows - target_lines) * cell_height))
+    direction = "down" if rows > target_lines else "up"
+    return f"resize_split:{direction},{amount}"
+
+
+def _ghostty_apply_resize(
+    main_terminal: str, hud_terminal: str, action: str
+) -> None:
+    script = "\n".join(
+        [
+            f'tell application id "{GHOSTTY_APPLICATION_ID}"',
+            f"set mainTerminal to first terminal whose id is {_applescript_string(main_terminal)}",
+            f"set hudTerminal to first terminal whose id is {_applescript_string(hud_terminal)}",
+            f"perform action {_applescript_string(action)} on hudTerminal",
+            "focus mainTerminal",
+            "end tell",
+        ]
+    )
+    _run_applescript(script, timeout=NATIVE_HUD_RESIZE_ACTION_TIMEOUT)
+
+
+def _wait_for_geometry(
+    path: Path,
+    deadline: float,
+    previous_rows: int | None = None,
+    previous_geometry: dict[str, int] | None = None,
+) -> dict[str, int] | None:
+    while time.monotonic() < deadline:
+        geometry = _read_terminal_geometry(path)
+        if geometry is not None:
+            if previous_geometry is not None:
+                if geometry != previous_geometry:
+                    return geometry
+            elif previous_rows is None or geometry["rows"] != previous_rows:
+                return geometry
+        time.sleep(0.05)
+    return _read_terminal_geometry(path)
+
+
+def _ghostty_resize_hud(
+    main_terminal: str,
+    hud_terminal: str,
+    geometry_path: Path,
+    backing_scale: float,
+) -> bool:
+    deadline = time.monotonic() + NATIVE_HUD_RESIZE_TIMEOUT
+    geometry = _wait_for_geometry(geometry_path, deadline)
+    current_scale = max(1.0, backing_scale)
+    for _ in range(8):
+        if geometry is None:
+            return False
+        action = _ghostty_resize_action(geometry, current_scale)
+        if action is None:
+            return geometry.get("rows") == HUD_LINES
+        # Do not start another AppleScript action once the overall resize
+        # deadline has elapsed.  An action can itself block for up to three
+        # seconds; allowing new actions here made cleanup outlive its bound.
+        if time.monotonic() >= deadline:
+            return geometry.get("rows") == HUD_LINES
+        try:
+            amount = int(action.rsplit(",", 1)[1])
+        except (IndexError, ValueError):
+            return False
+        previous_geometry = geometry
+        previous_rows = geometry["rows"]
+        _ghostty_apply_resize(main_terminal, hud_terminal, action)
+        if time.monotonic() >= deadline:
+            final_geometry = _read_terminal_geometry(geometry_path)
+            return bool(
+                final_geometry is not None
+                and final_geometry.get("rows") == HUD_LINES
+            )
+        geometry = _wait_for_geometry(
+            geometry_path,
+            deadline,
+            previous_rows,
+            previous_geometry,
+        )
+        if (
+            geometry is not None
+            and amount > 0
+            and previous_geometry.get("height_pixels", 0) > 0
+            and geometry.get("height_pixels", 0) > 0
+        ):
+            observed = abs(
+                geometry["height_pixels"] - previous_geometry["height_pixels"]
+            )
+            if observed > 0:
+                current_scale = max(0.5, min(8.0, observed / amount))
+    return geometry is not None and geometry.get("rows") == HUD_LINES
+
+
+def _maintain_ghostty_hud_size(
+    main_terminal: str,
+    hud_terminal: str,
+    geometry_path: Path,
+    backing_scale: float,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.wait(0.25):
+        geometry = _read_terminal_geometry(geometry_path)
+        if geometry is None or geometry.get("rows") == HUD_LINES:
+            continue
+        try:
+            if not _ghostty_resize_hud(
+                main_terminal, hud_terminal, geometry_path, backing_scale
+            ):
+                return
+        except Exception:
+            return
+
+
+def _start_ghostty_size_monitor(
+    main_terminal: str,
+    hud_terminal: str,
+    geometry_path: Path,
+    backing_scale: float,
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_maintain_ghostty_hud_size,
+        args=(
+            main_terminal,
+            hud_terminal,
+            geometry_path,
+            backing_scale,
+            stop_event,
+        ),
+        name="codex-hud-ghostty-resize",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
+
+
+def _wait_for_path(path: Path, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return path.exists()
+
+
+def _launch_native_ghostty(
+    arguments: list[str],
+    environment: dict[str, str],
+    run_id: str,
+    hud_command: str,
+) -> int:
+    ready_path = hud_home() / "runs" / f".{run_id}.ghostty-ready"
+    geometry_path = hud_home() / "runs" / f".{run_id}.ghostty-geometry.json"
+    target_directory = hud_home() / "runs" / f".{run_id}.ghostty-target"
+    hud_directory = hud_home() / "runs" / f".{run_id}.ghostty-hud"
+    working_directory = os.getcwd()
+    ready_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    hud_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _unlink(ready_path)
+    _unlink(geometry_path)
+    termination_handlers = _install_termination_handlers()
+    hud_terminal: str | None = None
+    hud_started = False
+    split_attempted = False
+    resize_stop: threading.Event | None = None
+    resize_thread: threading.Thread | None = None
+    try:
+        try:
+            marker_active = _ghostty_set_reported_working_directory(
+                target_directory
+            )
+            if not marker_active:
+                raise RuntimeError(
+                    "无法准确定位当前 Ghostty terminal（OSC 7 marker 不可用）"
+                )
+            split_attempted = True
+            try:
+                main_terminal, hud_terminal, backing_scale = _ghostty_open_hud(
+                    hud_command,
+                    environment,
+                    working_directory,
+                    target_directory,
+                    hud_directory,
+                )
+            finally:
+                if marker_active:
+                    _best_effort(
+                        _ghostty_set_reported_working_directory,
+                        working_directory,
+                    )
+            hud_started = True
+            _ghostty_make_readonly(hud_terminal)
+            _ghostty_focus_terminal(main_terminal)
+            if not _wait_for_path(ready_path, NATIVE_HUD_READY_TIMEOUT):
+                raise RuntimeError("native HUD startup timed out")
+            if not _ghostty_resize_hud(
+                main_terminal, hud_terminal, geometry_path, backing_scale
+            ):
+                raise RuntimeError(f"native HUD could not reach {HUD_LINES} rows")
+            resize_stop, resize_thread = _start_ghostty_size_monitor(
+                main_terminal, hud_terminal, geometry_path, backing_scale
+            )
+        except Exception as error:
+            _close_native_hud(hud_terminal, hud_directory, split_attempted)
+            hud_terminal = None
+            split_attempted = False
+            hud_started = False
+            _remove_run(run_id)
+            print(
+                f"Codex HUD：Ghostty 原生 HUD 启动失败（{error}）；本次直接启动 Codex。",
+                file=sys.stderr,
+            )
+            return subprocess.call(["codex", *arguments], env=environment)
+
+        codex_environment = environment.copy()
+        codex_environment["CODEX_HUD_RUN_ID"] = run_id
+        return subprocess.call(["codex", *arguments], env=codex_environment)
+    finally:
+        _suspend_termination_handlers()
+        try:
+            if resize_stop:
+                resize_stop.set()
+            if resize_thread:
+                resize_thread.join(
+                    timeout=(
+                        NATIVE_HUD_RESIZE_TIMEOUT
+                        + NATIVE_HUD_RESIZE_ACTION_TIMEOUT
+                        + 1.0
+                    )
+                )
+            if hud_started:
+                _mark_ended(run_id)
+            if hud_terminal or split_attempted:
+                _close_native_hud(hud_terminal, hud_directory, split_attempted)
+                hud_terminal = None
+                split_attempted = False
+            _remove_run(run_id)
+            _unlink(ready_path)
+            _unlink(geometry_path)
+            _best_effort(target_directory.rmdir)
+            _best_effort(hud_directory.rmdir)
+        finally:
+            _restore_termination_handlers(termination_handlers)
+
+
+def _guard_hud_pane_copy_mode(
+    hud_pane: str, socket_name: str | None = None
+) -> None:
+    """Keep fallback wheel events from scrolling the fixed HUD pane."""
+    subprocess.run(
+        _tmux(["set-option", "-p", "-t", hud_pane, "@is_hud", "1"], socket_name),
+        check=False,
+    )
+    subprocess.run(
+        _tmux(
+            [
+                "set-hook",
+                "-p",
+                "-t",
+                hud_pane,
+                "after-copy-mode",
+                'if-shell -F "#{@is_hud}" "copy-mode -q"',
+            ],
+            socket_name,
+        ),
+        check=False,
+    )
+
+
 def _tmux_command(arguments: list[str], environment: dict[str, str]) -> str:
     """Build a pane command with the caller's account-scoping environment."""
     prefix = [
         "env",
-        "-u",
-        "CODEX_HOME",
-        "-u",
-        "CODEX_HUD_HOME",
-        "-u",
-        "CODEX_HUD_RUN_ID",
+        "-u", "CODEX_HOME",
+        "-u", "CODEX_HUD_HOME",
+        "-u", "CODEX_HUD_RUN_ID",
     ]
     for key in ("CODEX_HOME", "CODEX_HUD_HOME", "PATH"):
         value = environment.get(key)
@@ -108,69 +654,97 @@ def _tmux_command(arguments: list[str], environment: dict[str, str]) -> str:
 
 def launch(arguments: list[str]) -> int:
     _require("codex")
-    _require("tmux")
     if not enabled():
         return subprocess.call(["codex", *arguments])
 
     run_id = f"{int(time.time())}-{os.getpid()}-{secrets.token_hex(3)}"
     environment = os.environ.copy()
-    environment["CODEX_HUD_RUN_ID"] = run_id
     hud_command = _tmux_command(
         [sys.executable, str(RENDERER), "--run-id", run_id], environment
     )
+    codex_arguments = _codex_arguments(arguments)
+
+    if _native_ghostty_hud(environment):
+        native_hud_command = _command_text(
+            [
+                *shlex.split(hud_command),
+                "--ready-file",
+                str(hud_home() / "runs" / f".{run_id}.ghostty-ready"),
+                "--geometry-file",
+                str(hud_home() / "runs" / f".{run_id}.ghostty-geometry.json"),
+            ]
+        )
+        return _launch_native_ghostty(
+            codex_arguments, environment, run_id, native_hud_command
+        )
+
+    _require("tmux")
 
     if environment.get("TMUX") and environment.get("TMUX_PANE"):
         current_pane = environment["TMUX_PANE"]
-        result = subprocess.run(
-            [
-                "tmux",
-                "split-window",
-                "-v",
-                "-l",
-                str(HUD_LINES),
-                "-t",
-                current_pane,
-                "-P",
-                "-F",
-                "#{pane_id}",
-                hud_command,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        hud_pane = result.stdout.strip()
-        # Mark the HUD pane so scroll-wheel bindings can identify it.
-        subprocess.run(
-            ["tmux", "set-option", "-p", "-t", hud_pane, "@is_hud", "1"],
-            check=False,
-        )
-        # Enable mouse at window level so tmux intercepts scroll events.
-        subprocess.run(
-            ["tmux", "set-option", "-w", "mouse", "on"],
-            check=False,
-        )
-        # HUD pane must not capture the scroll wheel: when the pane under
-        # the cursor carries @is_hud the event is silently dropped;
-        # otherwise tmux enters copy-mode so the user can scroll history.
-        subprocess.run(
-            [
-                "tmux", "bind-key", "-T", "root", "WheelUpPane",
-                "if-shell", "-F", "-t", "=",
-                "#{e|!=:#{@is_hud},1}",
-                "copy-mode -e",
-            ],
-            check=False,
-        )
-        subprocess.run(["tmux", "select-pane", "-t", current_pane], check=False)
+        mouse_lease: tuple[str, str, str | None] | None = None
+        hud_pane: str | None = None
+        termination_handlers = _install_termination_handlers()
         try:
-            return subprocess.call(["codex", *arguments], env=environment)
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "split-window",
+                    "-d",
+                    "-v",
+                    "-l",
+                    str(HUD_LINES),
+                    "-t",
+                    current_pane,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    hud_command,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            hud_pane = result.stdout.strip()
+            subprocess.run(
+                ["tmux", "select-pane", "-d", "-t", hud_pane], check=False
+            )
+            subprocess.run(
+                [
+                    "tmux",
+                    "set-hook",
+                    "-p",
+                    "-t",
+                    hud_pane,
+                    "after-select-pane",
+                    f"select-pane -t {current_pane}",
+                ],
+                check=False,
+            )
+            subprocess.run(["tmux", "select-pane", "-t", current_pane], check=False)
+            native_mouse = _native_terminal_mouse(environment)
+            if native_mouse:
+                mouse_lease = _acquire_native_mouse(current_pane)
+            else:
+                _guard_hud_pane_copy_mode(hud_pane)
+                mouse_lease = _acquire_tmux_mouse(current_pane)
+            codex_environment = environment.copy()
+            codex_environment["CODEX_HUD_RUN_ID"] = run_id
+            return subprocess.call(["codex", *codex_arguments], env=codex_environment)
         finally:
-            _mark_ended(run_id)
-            _kill_tmux("pane", hud_pane)
-            _remove_run(run_id)
+            _suspend_termination_handlers()
+            try:
+                _mark_ended(run_id)
+                if hud_pane:
+                    _kill_tmux("pane", hud_pane)
+                if mouse_lease:
+                    _release_native_mouse(mouse_lease)
+                _remove_run(run_id)
+            finally:
+                _restore_termination_handlers(termination_handlers)
 
     session_name = f"codex-hud-{int(time.time())}-{os.getpid()}"
+    socket_name = TMUX_SOCKET
     ready_path = hud_home() / "runs" / f".{run_id}.ready"
     exit_path = hud_home() / "runs" / f".{run_id}.exit"
     detached_path = hud_home() / "runs" / f".{run_id}.detached"
@@ -194,85 +768,113 @@ def launch(arguments: list[str]) -> int:
             "--detached-file",
             str(detached_path),
             "--",
-            *arguments,
+            *codex_arguments,
         ],
         environment,
     )
     term_size = shutil.get_terminal_size((120, 24))
-    created = subprocess.run(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-x", str(term_size.columns),
-            "-y", str(term_size.lines),
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-s",
-            session_name,
-            "-c",
-            os.getcwd(),
-            main_command,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    main_pane = created.stdout.strip()
+    termination_handlers = _install_termination_handlers()
+    main_pane = ""
     layout_ready = False
     try:
-        # This session belongs to the HUD wrapper, so its own tmux status bar is
-        # redundant. Enable mouse so the user can scroll the Codex pane history.
-        subprocess.run(
-            ["tmux", "set-option", "-t", session_name, "status", "off"],
-            check=False,
+        created = subprocess.run(
+            _tmux(
+                [
+                    "-f", "/dev/null",
+                    "start-server",
+                    ";",
+                    "set-option", "-g", "default-terminal", "tmux-256color",
+                    ";",
+                    "new-session",
+                    "-d",
+                    "-x", str(term_size.columns),
+                    "-y", str(term_size.lines),
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-s",
+                    session_name,
+                    "-c",
+                    os.getcwd(),
+                    main_command,
+                ],
+                socket_name,
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
         )
+        main_pane = created.stdout.strip()
         subprocess.run(
-            ["tmux", "set-option", "-t", session_name, "mouse", "on"],
+            _tmux(
+                ["set-option", "-t", session_name, "status", "off"],
+                socket_name,
+            ),
             check=False,
         )
         result = subprocess.run(
-            [
-                "tmux",
-                "split-window",
-                "-v",
-                "-l",
-                str(HUD_LINES),
-                "-t",
-                main_pane,
-                "-c",
-                os.getcwd(),
-                "-P",
-                "-F",
-                "#{pane_id}",
-                hud_command,
-            ],
+            _tmux(
+                [
+                    "split-window",
+                    "-d",
+                    "-v",
+                    "-l",
+                    str(HUD_LINES),
+                    "-t",
+                    main_pane,
+                    "-c",
+                    os.getcwd(),
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    hud_command,
+                ],
+                socket_name,
+            ),
             capture_output=True,
             text=True,
             check=True,
         )
         hud_pane = result.stdout.strip()
-        # Mark the HUD pane so scroll-wheel bindings can identify it.
         subprocess.run(
-            ["tmux", "set-option", "-p", "-t", hud_pane, "@is_hud", "1"],
+            _tmux(["select-pane", "-d", "-t", hud_pane], socket_name),
             check=False,
         )
-        # HUD pane must not capture the scroll wheel.
         subprocess.run(
-            [
-                "tmux", "bind-key", "-T", "root", "WheelUpPane",
-                "if-shell", "-F", "-t", "=",
-                "#{e|!=:#{@is_hud},1}",
-                "copy-mode -e",
-            ],
+            _tmux(
+                [
+                    "set-hook",
+                    "-p",
+                    "-t",
+                    hud_pane,
+                    "after-select-pane",
+                    f"select-pane -t {main_pane}",
+                ],
+                socket_name,
+            ),
             check=False,
+        )
+        if _native_terminal_mouse(environment):
+            standalone_mouse = "off"
+        else:
+            standalone_mouse = "on"
+            _guard_hud_pane_copy_mode(hud_pane, socket_name)
+        subprocess.run(
+            _tmux(
+                ["set-option", "-t", session_name, "mouse", standalone_mouse],
+                socket_name,
+            ),
+            check=True,
         )
         ready_path.touch(mode=0o600)
         layout_ready = True
-        subprocess.run(["tmux", "select-pane", "-t", main_pane], check=False)
-        attach_code = subprocess.call(["tmux", "attach-session", "-t", session_name])
-        if _tmux_session_exists(session_name):
+        subprocess.run(
+            _tmux(["select-pane", "-t", main_pane], socket_name), check=False
+        )
+        attach_code = subprocess.call(
+            _tmux(["attach-session", "-t", session_name], socket_name)
+        )
+        if _tmux_session_exists(session_name, socket_name):
             # A zero-code attach that leaves a live session is a normal user
             # detach. The in-session owner keeps Codex and HUD running.
             _best_effort(_write_private_text, detached_path, "1\n")
@@ -282,11 +884,12 @@ def launch(arguments: list[str]) -> int:
         except (FileNotFoundError, OSError, ValueError):
             return attach_code
     except BaseException:
-        if not layout_ready or _tmux_session_exists(session_name):
-            _kill_tmux("session", session_name)
+        if not layout_ready or _tmux_session_exists(session_name, socket_name):
+            _kill_tmux("session", session_name, socket_name)
         raise
     finally:
-        session_alive = _tmux_session_exists(session_name)
+        _suspend_termination_handlers()
+        session_alive = _tmux_session_exists(session_name, socket_name)
         if not layout_ready or not session_alive:
             _unlink(ready_path)
         if not session_alive:
@@ -294,6 +897,7 @@ def launch(arguments: list[str]) -> int:
             _remove_run(run_id)
             _unlink(exit_path)
             _unlink(detached_path)
+        _restore_termination_handlers(termination_handlers)
 
 
 def run_main(
@@ -307,6 +911,7 @@ def run_main(
     environment = os.environ.copy()
     environment["CODEX_HUD_RUN_ID"] = run_id
     exit_code = 1
+    termination_handlers = _install_termination_handlers()
     try:
         deadline = time.monotonic() + 10
         while not Path(ready_file).exists():
@@ -315,9 +920,10 @@ def run_main(
                 return 1
             time.sleep(0.05)
         _unlink(Path(ready_file))
-        exit_code = subprocess.call(["codex", *arguments], env=environment)
+        exit_code = subprocess.call(["codex", *_codex_arguments(arguments)], env=environment)
         return exit_code
     finally:
+        _suspend_termination_handlers()
         exit_path = Path(exit_file)
         detached_path = Path(detached_file)
         if not detached_path.exists():
@@ -329,6 +935,7 @@ def run_main(
         if detached_path.exists():
             _unlink(exit_path)
         _unlink(detached_path)
+        _restore_termination_handlers(termination_handlers)
 
 
 def main() -> int:

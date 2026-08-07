@@ -1,33 +1,56 @@
 # 架构设计
 
+## 插件层与启动层
+
+Codex HUD 已经是一个 Codex 插件，但插件和启动 wrapper 承担不同职责：
+
+- 插件 manifest 负责被 marketplace 发现、安装和启用。
+- `hooks/hooks.json` 负责接收 Codex 生命周期事件。
+- `skills/codex-hud/SKILL.md` 负责让 Codex 管理开关、状态和使用说明。
+- `scripts/codex-hud run` 必须在 Codex 启动前创建终端布局、注入运行环境并成为生命周期 owner。
+
+普通 `codex` 启动时，插件 Hook 虽然已加载，但没有 `CODEX_HUD_RUN_ID`，因此不会采集会话，也不会自动创建 HUD surface。这是避免全局插件误收普通会话的安全边界。
+
 ## 路线
 
-Codex 原生 `tui.status_line` 继续负责单行信息；本插件用 tmux 创建一个严格 8 行的侧车 pane。外层 wrapper 为当前进程设置随机 `CODEX_HUD_RUN_ID`，只有带该 ID 的 Hook 才采集事件，避免全局启用 Hook 后误收普通会话。首次 `SessionStart` 还会绑定当前 `CODEX_HOME` 指纹和 thread；不同 thread 的普通 `startup` 被拒绝，只有同账号下明确的 `clear` / `resume` 合法切换会迁移绑定。
+Codex 原生 `tui.status_line` 继续负责单行信息；本插件按承载终端选择严格 8 行的侧车 surface：macOS standalone Ghostty 使用原生 split，已在 tmux 内或非 Ghostty 环境使用 tmux pane。外层 wrapper 为当前进程设置随机 `CODEX_HUD_RUN_ID`，只有带该 ID 的 Hook 才采集事件。首次 `SessionStart` 还会绑定当前 `CODEX_HOME` 指纹和 thread；不同 thread 的普通 `startup` 被拒绝，只有同账号下明确的 `clear` / `resume` 合法切换会迁移绑定。
 
 ```text
-codex-hud run
-  ├─ Codex CLI ── lifecycle hooks ──> ~/.codex-hud/runs/<id>.json
-  │              └─ current transcript JSONL ───────────────────────┐
-  └─ tmux HUD renderer <─ state file + transcript + app-server account/read
+codex plugin add
+  └─ manifest + Hook + Skill ──> Codex 插件运行时
+
+外部终端: codex-hud run
+  ├─ 注入 CODEX_HUD_RUN_ID + --no-alt-screen
+  ├─ Ghostty/macOS standalone ── native split ──┐
+  ├─ tmux/non-Ghostty fallback ── tmux pane ────┤
+  └─ Codex CLI ── lifecycle hooks ──> ~/.codex-hud/runs/<id>.json
+                  └─ transcript JSONL + app-server ──> HUD renderer
 ```
 
 ## 设计取舍
 
 - 不 patch Codex TUI：降低升级耦合，关闭开关即可回退。
+- 不从 Hook 内启动嵌套 Codex：Hook 发生在当前 Codex 已启动之后，无法反向注入 `--no-alt-screen` 或安全接管父终端。
 - 不运行第二个会话读取历史：transcript 路径由当前会话 Hook 提供。
 - App Server 只读当前 `CODEX_HOME` 的账号和 rate limits；不用于猜测另一个进程的 thread。
 - 状态文件采用文件锁和原子替换；Hook 异常被吞掉，监控不能阻塞 Codex。
-- 独立 tmux session 关闭自己的 status bar、启用 `mouse on`；嵌入已有 tmux 时不修改用户 tmux 设置（除当前窗口启用 mouse）。
-- HUD 面板高度通过创建时 `resize-pane -y 8` 固定，不依赖运行时循环修正。
-- HUD 面板通过 `bind-key WheelUpPane` + 高度条件判断（height == 8）排除滚轮捕获。
-- 用户从独立 session detach 时保留后台 Codex；只有 Codex 真正退出或布局启动失败才清理 session。
-- 最终渲染无尾随换行，pane 高度等于内容行数。
+- Ghostty/macOS standalone 不创建 tmux 主 session；通过 Ghostty 原生 split 保持主 Codex surface 的滚轮、拖选、释放保持和右键原生语义。已在 tmux 内、非 Ghostty 或无法准确定位当前 Ghostty surface 时才使用 tmux fallback。
+- 原生 split 的 HUD surface 由 Ghostty 设置为 read-only；唯一的 OSC 7 working-directory marker 用于精确选择调用 wrapper 的 terminal，marker 不可用时安全回退，不猜测 front window。
+- 原生 split 的高度由 geometry monitor 动态校准到 `HUD_LINES`；tmux fallback 使用创建时的 `split-window -l 8`。
+- 不安装新的 server-global 鼠标绑定；升级时只识别带 `@is_hud` / `@hud_main_pane` 标记的旧版绑定，并恢复当前 tmux 默认命令。
+- pane 内的终端能力保持 `tmux-256color`，不把外层 Ghostty 的 `TERM=xterm-ghostty` 伪装传入 Codex。
+- HUD 包装路径使用 Codex 官方 `--no-alt-screen`，让 transcript 写入承载终端的 scrollback；普通无 HUD 启动不受影响。
+- Ghostty/macOS standalone 由 Ghostty 原生滚轮浏览历史；HUD renderer 不声明 mouse capture，也不注入鼠标协议。已在 tmux 内或非 Ghostty/非 macOS 才使用 tmux fallback。
+- 用户从独立 tmux session detach 时保留后台 Codex；只有 Codex 真正退出或布局启动失败才清理 session。
+- 最终渲染无尾随换行，surface 高度等于 `HUD_LINES`。
 - `HUD_LINES` 在 `hud_state.py` 中定义为单一真源。
 
 ## Context 口径
 
-Context 百分比基于 Codex 写入 transcript 的原始 `model_context_window` 与 `last_token_usage.total_tokens` 值，直接计算使用比例。与 Codex 原生 TUI 的百分比口径一致（分母均为 Codex 模型目录的当前有效上下文窗口）。
+Context 百分比直接使用 Codex transcript 中的 `model_context_window` 与 `last_token_usage.total_tokens`，当前 baseline 为 0。先计算剩余比例并按 Rust 非负数 `round()` 取整，再用 `100 - remaining_percent` 得到已用比例。
 
 ## 兼容层
 
-`scripts/metrics.py` 隔离版本敏感指标。Codex 升级后先用官方源码/协议重新核对 Context 公式，再更新常量和 fixture。
+`scripts/metrics.py` 隔离版本敏感指标。本次文档审计环境为 Codex CLI 0.147.0；Codex 升级后应同时核对 transcript 协议、原生 TUI 口径、测试 fixture 和 `docs/metrics-semantics.md`。
+
+完整的插件原生启动可行性分析见 `docs/plugin-startup-analysis.md`。

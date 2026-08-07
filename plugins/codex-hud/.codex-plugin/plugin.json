@@ -1,7 +1,7 @@
 {
   "name": "codex-hud",
-  "version": "0.3.0",
-  "description": "Local tmux HUD for the active Codex CLI session",
+  "version": "0.3.13+codex.20260807054520",
+  "description": "Local eight-line HUD for the active Codex CLI session",
   "author": {
     "name": "Local developer"
   },
@@ -16,8 +16,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex HUD",
-    "shortDescription": "Show live Codex session telemetry in a tmux HUD",
-    "longDescription": "Adds an opt-in, local-only five-line tmux HUD for the current Codex account and session. It displays official-parity context pressure, tool and subagent activity, Todo progress, cache usage, estimated API-equivalent cost, quotas, and elapsed session time.",
+    "shortDescription": "Show live Codex session telemetry beside Codex",
+    "longDescription": "Adds an opt-in, local-only eight-line HUD for the current Codex account and session. macOS standalone Ghostty uses a native split; tmux panes remain the fallback for nested tmux and non-Ghostty terminals. It displays official-parity context pressure, tool and subagent activity, Todo progress, cache usage, estimated API-equivalent cost, quotas, and elapsed session time.",
     "developerName": "Local developer",
     "category": "Developer Tools",
     "capabilities": [

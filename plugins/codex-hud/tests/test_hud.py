@@ -5,10 +5,14 @@ import io
 import importlib.machinery
 import importlib.util
 import os
+import struct
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +24,7 @@ import hud_hook
 import hud_render
 import hud_state
 import metrics
+import tmux_mouse
 
 
 CLI_LOADER = importlib.machinery.SourceFileLoader("codex_hud_cli", str(SCRIPTS / "codex-hud"))
@@ -188,6 +193,89 @@ class HudTest(unittest.TestCase):
         with mock.patch.object(hud_render.subprocess, "Popen", side_effect=OSError):
             self.assertEqual(hud_render.AccountReader().read(), ({}, {}))
 
+    def test_account_reader_treats_json_rpc_error_as_completed(self) -> None:
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    "\n".join(
+                        [
+                            json.dumps({"id": 0, "result": {}}),
+                            json.dumps(
+                                {
+                                    "id": 1,
+                                    "result": {
+                                        "account": {
+                                            "type": "chatgpt",
+                                            "email": "me@example.com",
+                                            "planType": "plus",
+                                        }
+                                    },
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "id": 2,
+                                    "error": {"code": -32600, "message": "unsupported"},
+                                }
+                            ),
+                            "",
+                        ]
+                    )
+                )
+
+            def poll(self) -> int | None:
+                return None
+
+            def terminate(self) -> None:
+                return None
+
+            def wait(self, timeout: float) -> int:
+                del timeout
+                return 0
+
+        process = FakeProcess()
+        with mock.patch.object(hud_render.subprocess, "Popen", return_value=process):
+            started = time.perf_counter()
+            account, limits = hud_render.AccountReader().read(timeout=0.5)
+        self.assertLess(time.perf_counter() - started, 0.3)
+        self.assertEqual(account["type"], "chatgpt")
+        self.assertEqual(limits, {})
+
+    def test_account_poller_does_not_block_first_snapshot(self) -> None:
+        class BlockingReader:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def read(self) -> tuple[dict[str, object], dict[str, object]]:
+                self.started.set()
+                self.release.wait(timeout=2)
+                return {"type": "apiKey"}, {}
+
+        reader = BlockingReader()
+        poller = hud_render.AccountPoller(reader, refresh_seconds=60)
+        try:
+            poller.start()
+            self.assertTrue(reader.started.wait(timeout=1))
+            started = time.perf_counter()
+            account, limits, loaded = poller.snapshot()
+            self.assertLess(time.perf_counter() - started, 0.1)
+            self.assertEqual((account, limits, loaded), ({}, {}, False))
+            reader.release.set()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                account, limits, loaded = poller.snapshot()
+                if loaded:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(account, {"type": "apiKey"})
+            self.assertEqual(limits, {})
+            self.assertTrue(loaded)
+        finally:
+            reader.release.set()
+            poller.stop()
+
     def test_render_contains_requested_sections(self) -> None:
         state = hud_state.default_state(self.run_id)
         state.update(
@@ -215,6 +303,28 @@ class HudTest(unittest.TestCase):
         self.assertEqual(len(lines), 8)
         for section in ("acct:me/plus", "CTX", "CACHE", "TOOLS", "AGENTS", "SKILLS", "TODO"):
             self.assertIn(section, output)
+
+    def test_api_render_exposes_usage_and_marks_estimate(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update({"cwd": self.temporary.name, "model": "gpt-5.6-terra"})
+        scanner = hud_render.TranscriptScanner()
+        scanner.total = {
+            "input_tokens": 1_000_000,
+            "cached_input_tokens": 800_000,
+            "output_tokens": 100_000,
+            "reasoning_output_tokens": 25_000,
+        }
+        lines = hud_render.render_lines(
+            state,
+            scanner,
+            {"type": "apiKey"},
+            {},
+        )
+        output = "\n".join(lines)
+        self.assertIn("acct:API key", output)
+        self.assertIn("API equiv.$2.20", output)
+        self.assertIn("API in 200k + cache 800k · out 100k · reasoning 25k", output)
+        self.assertNotIn("primary", output)
 
     def test_context_matches_codex_0146_native_tui(self) -> None:
         usage = metrics.official_context_usage(122_880, 258_400)
@@ -333,12 +443,478 @@ class HudTest(unittest.TestCase):
     def test_visible_clip_counts_wide_characters_and_removes_overflow(self) -> None:
         self.assertEqual(hud_render.visible_clip("缓存abcdef", 6), "缓存ab")
 
+    def test_tmux_command_leaves_term_owned_by_tmux(self) -> None:
+        command = codex_hud_cli._tmux_command(
+            ["codex"],
+            {
+                "PATH": "/opt/bin",
+                "TERM": "xterm-ghostty",
+                "CODEX_HOME": "/tmp/codex-home",
+            },
+        )
+        self.assertIn("PATH=/opt/bin", command)
+        self.assertIn("CODEX_HOME=/tmp/codex-home", command)
+        self.assertNotIn("TERM=", command)
+
+    def test_hud_forces_codex_native_inline_scrollback_mode(self) -> None:
+        self.assertEqual(
+            codex_hud_cli._codex_arguments(["-C", "/tmp/project"]),
+            ["--no-alt-screen", "-C", "/tmp/project"],
+        )
+        self.assertEqual(
+            codex_hud_cli._codex_arguments(["--no-alt-screen", "resume", "--last"]),
+            ["--no-alt-screen", "resume", "--last"],
+        )
+
+    def test_standalone_ghostty_routes_to_native_split_without_tmux(self) -> None:
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+            "TERM_PROGRAM": "ghostty",
+        }
+        with mock.patch.object(
+            codex_hud_cli, "enabled", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli, "_require"
+        ) as require, mock.patch.object(
+            codex_hud_cli.os, "environ", environment
+        ), mock.patch.object(
+            codex_hud_cli, "_native_ghostty_hud", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli, "_launch_native_ghostty", return_value=17
+        ) as native, mock.patch.object(
+            codex_hud_cli.subprocess, "run"
+        ) as tmux_run:
+            self.assertEqual(codex_hud_cli.launch(["resume", "--last"]), 17)
+
+        require.assert_called_once_with("codex")
+        native.assert_called_once_with(
+            ["--no-alt-screen", "resume", "--last"],
+            environment,
+            mock.ANY,
+            mock.ANY,
+        )
+        tmux_run.assert_not_called()
+
+    def test_native_ghostty_launch_closes_only_its_hud_surface(self) -> None:
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        lease = ("main-terminal", "hud-terminal", 2.0)
+        resize_stop = mock.Mock()
+        resize_thread = mock.Mock()
+        cleanup_order: list[str] = []
+        resize_thread.join.side_effect = lambda **_kwargs: cleanup_order.append("join")
+        with mock.patch.object(
+            codex_hud_cli, "_ghostty_open_hud", return_value=lease
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_make_readonly"
+        ) as make_readonly, mock.patch.object(
+            codex_hud_cli, "_ghostty_focus_terminal"
+        ) as focus_terminal, mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_set_reported_working_directory",
+            return_value=True,
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_resize_hud", return_value=True
+        ) as resize, mock.patch.object(
+            codex_hud_cli, "_wait_for_path", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli,
+            "_start_ghostty_size_monitor",
+            return_value=(resize_stop, resize_thread),
+        ) as start_monitor, mock.patch.object(
+            codex_hud_cli.subprocess, "call", return_value=0
+        ) as codex_call, mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_close_terminal",
+            side_effect=lambda _terminal: cleanup_order.append("close"),
+        ) as close_terminal, mock.patch.object(
+            codex_hud_cli, "_mark_ended"
+        ) as mark_ended, mock.patch.object(
+            codex_hud_cli, "_remove_run"
+        ) as remove_run, mock.patch.object(
+            codex_hud_cli, "_install_termination_handlers", return_value={}
+        ), mock.patch.object(
+            codex_hud_cli, "_suspend_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli, "_restore_termination_handlers"
+        ):
+            self.assertEqual(
+                codex_hud_cli._launch_native_ghostty(
+                    ["--no-alt-screen"], environment, "native-run", "hud command"
+                ),
+                0,
+            )
+
+        resize.assert_called_once_with(
+            "main-terminal", "hud-terminal", mock.ANY, 2.0
+        )
+        make_readonly.assert_called_once_with("hud-terminal")
+        focus_terminal.assert_called_once_with("main-terminal")
+        start_monitor.assert_called_once_with(
+            "main-terminal", "hud-terminal", mock.ANY, 2.0
+        )
+        resize_stop.set.assert_called_once_with()
+        resize_thread.join.assert_called_once_with(timeout=12.0)
+        codex_call.assert_called_once_with(
+            ["codex", "--no-alt-screen"],
+            env={**environment, "CODEX_HUD_RUN_ID": "native-run"},
+        )
+        close_terminal.assert_called_once_with("hud-terminal")
+        self.assertEqual(cleanup_order, ["join", "close"])
+        mark_ended.assert_called_once_with("native-run")
+        remove_run.assert_called_once_with("native-run")
+
+    def test_ghostty_open_hud_uses_unambiguous_literal_separator(self) -> None:
+        target = Path(self.temporary.name) / "literal-separator-target"
+        with mock.patch.object(
+            codex_hud_cli,
+            "_run_applescript",
+            return_value="main-terminal|hud-terminal|2.0",
+        ) as run_applescript:
+            self.assertEqual(
+                codex_hud_cli._ghostty_open_hud(
+                    "hud command",
+                    {"PATH": "/opt/bin"},
+                    "/tmp/project",
+                    target,
+                ),
+                ("main-terminal", "hud-terminal", 2.0),
+            )
+
+        script = run_applescript.call_args.args[0]
+        self.assertIn('& "|" &', script)
+        self.assertNotIn(" & tab & ", script)
+        self.assertNotIn("toggle_readonly", script)
+
+    def test_ghostty_open_hud_targets_the_calling_surface_marker(self) -> None:
+        target = Path(self.temporary.name) / "surface target"
+        with mock.patch.object(
+            codex_hud_cli,
+            "_run_applescript",
+            return_value="main-terminal|hud-terminal|not-a-number",
+        ) as run_applescript:
+            self.assertEqual(
+                codex_hud_cli._ghostty_open_hud(
+                    "hud command",
+                    {"PATH": "/opt/bin"},
+                    "/tmp/project",
+                    target,
+                ),
+                ("main-terminal", "hud-terminal", 1.0),
+            )
+
+        script = run_applescript.call_args.args[0]
+        self.assertIn(
+            f'first terminal whose working directory is "{target.resolve()}"',
+            script,
+        )
+        self.assertIn("NSScreen's screens()", script)
+
+    def test_native_startup_failure_closes_split_before_fallback(self) -> None:
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        with mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_open_hud",
+            return_value=("main-terminal", "hud-terminal", 2.0),
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_make_readonly", side_effect=RuntimeError("readonly")
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_close_terminal"
+        ) as close_terminal, mock.patch.object(
+            codex_hud_cli, "_ghostty_set_reported_working_directory", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli, "_remove_run"
+        ), mock.patch.object(
+            codex_hud_cli, "_install_termination_handlers", return_value={}
+        ), mock.patch.object(
+            codex_hud_cli, "_suspend_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli, "_restore_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli.subprocess, "call", return_value=23
+        ) as codex_call:
+            self.assertEqual(
+                codex_hud_cli._launch_native_ghostty(
+                    ["--no-alt-screen"], environment, "failed-native", "hud command"
+                ),
+                23,
+            )
+
+        close_terminal.assert_called_once_with("hud-terminal")
+        codex_call.assert_called_once_with(
+            ["codex", "--no-alt-screen"], env=environment
+        )
+
+    def test_native_marker_failure_falls_back_without_opening_wrong_surface(self) -> None:
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        with mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_set_reported_working_directory",
+            return_value=False,
+        ), mock.patch.object(codex_hud_cli, "_ghostty_open_hud") as open_hud, mock.patch.object(
+            codex_hud_cli, "_ghostty_close_terminal_by_working_directory"
+        ) as close_by_directory, mock.patch.object(
+            codex_hud_cli, "_remove_run"
+        ), mock.patch.object(
+            codex_hud_cli, "_install_termination_handlers", return_value={}
+        ), mock.patch.object(
+            codex_hud_cli, "_suspend_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli, "_restore_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli.subprocess, "call", return_value=23
+        ) as codex_call:
+            self.assertEqual(
+                codex_hud_cli._launch_native_ghostty(
+                    ["--no-alt-screen"], environment, "marker-failure", "hud command"
+                ),
+                23,
+            )
+
+        open_hud.assert_not_called()
+        close_by_directory.assert_not_called()
+        codex_call.assert_called_once_with(
+            ["codex", "--no-alt-screen"], env=environment
+        )
+
+    def test_native_split_timeout_closes_orphan_by_marker_directory(self) -> None:
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        timeout = subprocess.TimeoutExpired(["osascript"], 15)
+        with mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_set_reported_working_directory",
+            return_value=True,
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_open_hud", side_effect=timeout
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_close_terminal_by_working_directory"
+        ) as close_by_directory, mock.patch.object(
+            codex_hud_cli, "_remove_run"
+        ), mock.patch.object(
+            codex_hud_cli, "_install_termination_handlers", return_value={}
+        ), mock.patch.object(
+            codex_hud_cli, "_suspend_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli, "_restore_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli.subprocess, "call", return_value=23
+        ):
+            self.assertEqual(
+                codex_hud_cli._launch_native_ghostty(
+                    ["--no-alt-screen"], environment, "split-timeout", "hud command"
+                ),
+                23,
+            )
+
+        close_by_directory.assert_called_once()
+        marker_path = close_by_directory.call_args.args[0]
+        self.assertIn(".split-timeout.ghostty-hud", str(marker_path))
+
+    def test_native_signal_during_split_closes_orphan_by_marker_directory(self) -> None:
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        with mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_set_reported_working_directory",
+            return_value=True,
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_open_hud", side_effect=SystemExit(143)
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_close_terminal_by_working_directory"
+        ) as close_by_directory, mock.patch.object(
+            codex_hud_cli, "_remove_run"
+        ), mock.patch.object(
+            codex_hud_cli, "_install_termination_handlers", return_value={}
+        ), mock.patch.object(
+            codex_hud_cli, "_suspend_termination_handlers"
+        ), mock.patch.object(
+            codex_hud_cli, "_restore_termination_handlers"
+        ):
+            with self.assertRaises(SystemExit):
+                codex_hud_cli._launch_native_ghostty(
+                    ["--no-alt-screen"], environment, "split-signal", "hud command"
+                )
+
+        close_by_directory.assert_called_once()
+        marker_path = close_by_directory.call_args.args[0]
+        self.assertIn(".split-signal.ghostty-hud", str(marker_path))
+
+    def test_native_cleanup_recovers_when_terminal_id_close_fails(self) -> None:
+        marker = Path(self.temporary.name) / "unique-hud-marker"
+        with mock.patch.object(
+            codex_hud_cli,
+            "_ghostty_close_terminal",
+            side_effect=RuntimeError("terminal disappeared"),
+        ) as close_terminal, mock.patch.object(
+            codex_hud_cli, "_ghostty_close_terminal_by_working_directory"
+        ) as close_by_directory:
+            codex_hud_cli._close_native_hud("hud-terminal", marker, True)
+
+        close_terminal.assert_called_once_with("hud-terminal")
+        close_by_directory.assert_called_once_with(marker)
+
+    def test_resize_calibrates_unknown_display_scale_from_geometry_delta(self) -> None:
+        geometries = [
+            {"rows": 22, "columns": 120, "width_pixels": 1928, "height_pixels": 748},
+            {"rows": 15, "columns": 120, "width_pixels": 1928, "height_pixels": 510},
+            {"rows": 8, "columns": 120, "width_pixels": 1928, "height_pixels": 272},
+        ]
+        applied: list[str] = []
+        with mock.patch.object(
+            codex_hud_cli, "_wait_for_geometry", side_effect=geometries
+        ), mock.patch.object(
+            codex_hud_cli, "_ghostty_apply_resize", side_effect=lambda _m, _h, action: applied.append(action)
+        ):
+            self.assertTrue(
+                codex_hud_cli._ghostty_resize_hud(
+                    "main", "hud", Path("/tmp/geometry.json"), 2.0
+                )
+            )
+
+        self.assertEqual(applied, ["resize_split:down,238", "resize_split:down,238"])
+
+    def test_resize_does_not_start_action_after_deadline(self) -> None:
+        with mock.patch.object(
+            codex_hud_cli.time,
+            "monotonic",
+            side_effect=[100.0, 109.0],
+        ), mock.patch.object(
+            codex_hud_cli, "_wait_for_geometry", return_value={
+                "rows": 22,
+                "columns": 120,
+                "width_pixels": 1928,
+                "height_pixels": 748,
+            }
+        ), mock.patch.object(codex_hud_cli, "_ghostty_apply_resize") as apply_resize:
+            self.assertFalse(
+                codex_hud_cli._ghostty_resize_hud(
+                    "main", "hud", Path("/tmp/geometry.json"), 2.0
+                )
+            )
+        apply_resize.assert_not_called()
+
+    def test_ghostty_working_directory_marker_is_encoded_and_invisible(self) -> None:
+        output = mock.Mock()
+        output.fileno.return_value = 19
+        with mock.patch.object(codex_hud_cli.sys, "stdout", output), mock.patch.object(
+            codex_hud_cli.os, "isatty", return_value=True
+        ):
+            self.assertTrue(
+                codex_hud_cli._ghostty_set_reported_working_directory(
+                    Path(self.temporary.name) / "surface target"
+                )
+            )
+
+        written = output.write.call_args.args[0]
+        self.assertTrue(written.startswith("\033]7;file://localhost/"))
+        self.assertIn("surface%20target", written)
+        self.assertTrue(written.endswith("\a"))
+        output.flush.assert_called_once_with()
+
+    def test_native_hud_resize_uses_terminal_pixels_and_retina_scale(self) -> None:
+        self.assertEqual(
+            codex_hud_cli._ghostty_resize_action(
+                {"rows": 22, "height_pixels": 748}, 2.0
+            ),
+            "resize_split:down,238",
+        )
+        self.assertEqual(
+            codex_hud_cli._ghostty_resize_action(
+                {"rows": 4, "height_pixels": 136}, 2.0
+            ),
+            "resize_split:up,68",
+        )
+        self.assertIsNone(
+            codex_hud_cli._ghostty_resize_action(
+                {"rows": hud_state.HUD_LINES, "height_pixels": 272}, 2.0
+            )
+        )
+
+    def test_renderer_reports_terminal_rows_and_pixels_for_native_resize(self) -> None:
+        packed = struct.pack("HHHH", 8, 120, 1928, 272)
+        with mock.patch.object(hud_render.fcntl, "ioctl", return_value=packed):
+            self.assertEqual(
+                hud_render.terminal_geometry(1),
+                {
+                    "rows": 8,
+                    "columns": 120,
+                    "width_pixels": 1928,
+                    "height_pixels": 272,
+                },
+            )
+
+    def test_standalone_tmux_socket_can_be_isolated_for_e2e(self) -> None:
+        self.assertEqual(codex_hud_cli.TMUX_SOCKET, "codex-hud")
+
+    def test_native_terminal_mouse_is_scoped_to_macos_ghostty(self) -> None:
+        with mock.patch.object(codex_hud_cli.sys, "platform", "darwin"):
+            self.assertTrue(codex_hud_cli._native_terminal_mouse({"TERM_PROGRAM": "ghostty"}))
+            self.assertFalse(codex_hud_cli._native_terminal_mouse({"TERM_PROGRAM": "iTerm.app"}))
+        with mock.patch.object(codex_hud_cli.sys, "platform", "linux"):
+            self.assertFalse(codex_hud_cli._native_terminal_mouse({"TERM_PROGRAM": "ghostty"}))
+
+    def test_termination_signal_uses_python_cleanup_path(self) -> None:
+        installed: dict[int, object] = {}
+        restored: list[tuple[int, object]] = []
+
+        def set_handler(signum: int, handler: object) -> None:
+            if callable(handler):
+                installed[signum] = handler
+            else:
+                restored.append((signum, handler))
+
+        with mock.patch.object(
+            codex_hud_cli.signal, "getsignal", return_value="previous"
+        ), mock.patch.object(
+            codex_hud_cli.signal, "signal", side_effect=set_handler
+        ):
+            previous = codex_hud_cli._install_termination_handlers()
+            handler = installed[codex_hud_cli.signal.SIGTERM]
+            assert callable(handler)
+            with self.assertRaisesRegex(SystemExit, "143"):
+                handler(codex_hud_cli.signal.SIGTERM, None)
+            codex_hud_cli._suspend_termination_handlers()
+            codex_hud_cli._restore_termination_handlers(previous)
+
+        self.assertIn((codex_hud_cli.signal.SIGTERM, codex_hud_cli.signal.SIG_IGN), restored)
+        self.assertIn((codex_hud_cli.signal.SIGHUP, codex_hud_cli.signal.SIG_IGN), restored)
+        self.assertIn((codex_hud_cli.signal.SIGTERM, "previous"), restored)
+        self.assertIn((codex_hud_cli.signal.SIGHUP, "previous"), restored)
+
     def test_embedded_tmux_is_killed_even_when_state_cleanup_fails(self) -> None:
         split = mock.Mock(stdout="%hud\n")
         run_calls: list[list[str]] = []
+        option_state: dict[str, str] = {}
 
         def fake_run(arguments: list[str], **_kwargs: object) -> mock.Mock:
             run_calls.append(arguments)
+            if "display-message" in arguments:
+                return mock.Mock(stdout="$1\n", returncode=0)
+            if "show-options" in arguments:
+                name = arguments[-1]
+                if name == "mouse" and "-A" in arguments:
+                    return mock.Mock(
+                        stdout=f"{option_state.get('mouse', 'off')}\n", returncode=0
+                    )
+                return mock.Mock(stdout=f"{option_state.get(name, '')}\n", returncode=0)
+            if "set-option" in arguments and "-u" not in arguments:
+                option_state[arguments[-2]] = arguments[-1]
+            if "set-option" in arguments and "-u" in arguments:
+                option_state.pop(arguments[-1], None)
             if arguments[1] == "split-window":
                 return split
             return mock.Mock(returncode=0)
@@ -355,23 +931,237 @@ class HudTest(unittest.TestCase):
             codex_hud_cli.subprocess, "run", side_effect=fake_run
         ), mock.patch.object(
             codex_hud_cli.subprocess, "call", return_value=0
-        ), mock.patch.object(
+        ) as codex_call, mock.patch.object(
             codex_hud_cli, "mark_ended", side_effect=OSError("state unavailable")
         ), mock.patch.object(
             codex_hud_cli, "remove_run", side_effect=OSError("state unavailable")
-        ):
+        ), mock.patch.object(
+            codex_hud_cli, "_native_terminal_mouse", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli, "_acquire_native_mouse", return_value=("$1", "holder", None)
+        ) as acquire, mock.patch.object(
+            codex_hud_cli, "_release_native_mouse"
+        ) as release:
             self.assertEqual(codex_hud_cli.launch([]), 0)
 
         self.assertIn(["tmux", "kill-pane", "-t", "%hud"], run_calls)
+        embedded_split = next(call for call in run_calls if "split-window" in call)
+        self.assertLess(embedded_split.index("-d"), embedded_split.index("-v"))
+        self.assertIn(
+            ["tmux", "select-pane", "-d", "-t", "%hud"], run_calls
+        )
+        self.assertIn(
+            [
+                "tmux",
+                "set-hook",
+                "-p",
+                "-t",
+                "%hud",
+                "after-select-pane",
+                "select-pane -t %main",
+            ],
+            run_calls,
+        )
+        self.assertFalse(any(call[1] == "bind-key" for call in run_calls))
+        codex_call.assert_called_once()
+        self.assertEqual(codex_call.call_args.args[0], ["codex", "--no-alt-screen"])
+        self.assertEqual(codex_call.call_args.kwargs["env"]["TMUX_PANE"], "%main")
+        self.assertIn("CODEX_HUD_RUN_ID", codex_call.call_args.kwargs["env"])
+        acquire.assert_called_once_with("%main")
+        release.assert_called_once_with(("$1", "holder", None))
+
+    def test_native_mouse_lease_preserves_inheritance_and_concurrency(self) -> None:
+        options: dict[str, str] = {}
+
+        def read_option(
+            _session: str,
+            name: str,
+            effective: bool = False,
+            socket_name: str | None = None,
+        ) -> str:
+            del socket_name
+            if name == "mouse" and effective:
+                return options.get(name, "on")
+            return options.get(name, "")
+
+        def set_option(
+            _session: str, name: str, value: str, socket_name: str | None = None
+        ) -> None:
+            del socket_name
+            options[name] = value
+
+        def unset_option(
+            _session: str, name: str, socket_name: str | None = None
+        ) -> None:
+            del socket_name
+            options.pop(name, None)
+
+        with mock.patch.object(
+            tmux_mouse, "session_id", return_value="$1"
+        ), mock.patch.object(
+            tmux_mouse, "mouse_state_lock", side_effect=lambda *_args: nullcontext()
+        ), mock.patch.object(
+            tmux_mouse, "restore_legacy_mouse_bindings", return_value=False
+        ), mock.patch.object(
+            tmux_mouse, "session_option", side_effect=read_option
+        ), mock.patch.object(
+            tmux_mouse, "set_session_option", side_effect=set_option
+        ), mock.patch.object(
+            tmux_mouse, "unset_session_option", side_effect=unset_option
+        ), mock.patch.object(
+            tmux_mouse.secrets, "token_hex", side_effect=["one", "two"]
+        ):
+            first = tmux_mouse.acquire_native_mouse("%one")
+            second = tmux_mouse.acquire_native_mouse("%two")
+            self.assertEqual(options["mouse"], "off")
+            self.assertEqual(len(options[tmux_mouse.MOUSE_HOLDERS_OPTION].split(",")), 2)
+
+            tmux_mouse.release_native_mouse(first)
+            self.assertEqual(options["mouse"], "off")
+            self.assertEqual(len(options[tmux_mouse.MOUSE_HOLDERS_OPTION].split(",")), 1)
+
+            tmux_mouse.release_native_mouse(second)
+            self.assertNotIn("mouse", options)
+            self.assertNotIn(tmux_mouse.MOUSE_HOLDERS_OPTION, options)
+
+    def test_native_mouse_lease_wins_mixed_mode_then_restores_fallback(self) -> None:
+        options: dict[str, str] = {}
+
+        def read_option(
+            _session: str,
+            name: str,
+            effective: bool = False,
+            socket_name: str | None = None,
+        ) -> str:
+            del socket_name
+            if name == "mouse" and effective:
+                return options.get(name, "off")
+            return options.get(name, "")
+
+        with mock.patch.object(
+            tmux_mouse, "session_id", return_value="$1"
+        ), mock.patch.object(
+            tmux_mouse, "mouse_state_lock", side_effect=lambda *_args: nullcontext()
+        ), mock.patch.object(
+            tmux_mouse, "restore_legacy_mouse_bindings", return_value=False
+        ), mock.patch.object(
+            tmux_mouse, "session_option", side_effect=read_option
+        ), mock.patch.object(
+            tmux_mouse,
+            "set_session_option",
+            side_effect=lambda _session, name, value, _socket=None: options.__setitem__(name, value),
+        ), mock.patch.object(
+            tmux_mouse,
+            "unset_session_option",
+            side_effect=lambda _session, name, _socket=None: options.pop(name, None),
+        ), mock.patch.object(
+            tmux_mouse.secrets, "token_hex", side_effect=["native", "fallback"]
+        ):
+            native = tmux_mouse.acquire_native_mouse("%native")
+            fallback = tmux_mouse.acquire_tmux_mouse("%fallback")
+            self.assertEqual(options["mouse"], "off")
+
+            tmux_mouse.release_native_mouse(native)
+            self.assertEqual(options["mouse"], "on")
+
+            tmux_mouse.release_native_mouse(fallback)
+            self.assertNotIn("mouse", options)
+
+    def test_non_ghostty_fallback_still_enables_tmux_mouse(self) -> None:
+        calls: list[tuple[str, str]] = []
+        with mock.patch.object(
+            tmux_mouse, "_acquire_mouse", side_effect=lambda _pane, _socket, value: calls.append(("mouse", value)) or ("$1", "holder", None)
+        ):
+            self.assertEqual(
+                tmux_mouse.acquire_tmux_mouse("%main"), ("$1", "holder", None)
+            )
+        self.assertEqual(calls, [("mouse", "on")])
+
+    def test_embedded_split_failure_never_acquires_mouse_lease(self) -> None:
+        environment = {
+            "TMUX": "socket",
+            "TMUX_PANE": "%main",
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        split_error = subprocess.CalledProcessError(1, ["tmux", "split-window"])
+        with mock.patch.object(
+            codex_hud_cli, "enabled", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli, "_require"
+        ), mock.patch.object(
+            codex_hud_cli.os, "environ", environment
+        ), mock.patch.object(
+            codex_hud_cli, "_acquire_native_mouse"
+        ) as acquire, mock.patch.object(
+            codex_hud_cli, "_release_native_mouse"
+        ) as release, mock.patch.object(
+            codex_hud_cli.subprocess, "run", side_effect=split_error
+        ), mock.patch.object(
+            codex_hud_cli, "_mark_ended"
+        ), mock.patch.object(
+            codex_hud_cli, "_remove_run"
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                codex_hud_cli.launch([])
+        acquire.assert_not_called()
+        release.assert_not_called()
+
+    def test_legacy_mouse_binding_migration_restores_defaults(self) -> None:
+        run_calls: list[list[str]] = []
+
+        def current_binding(
+            table: str, key: str, _socket_name: str | None = None
+        ) -> str | None:
+            if (table, key) == ("root", "WheelUpPane"):
+                return 'if-shell -F "#{@is_hud}" "" "send-keys -M"'
+            if (table, key) == ("root", "WheelDownPane"):
+                return 'if-shell -F "#{@hud_main_pane}" "" "send-keys -M"'
+            return None
+
+        def defaults(table: str) -> dict[str, str]:
+            if table == "root":
+                return {"WheelUpPane": r"select-pane \; copy-mode -e"}
+            return {}
+
+        def fake_run(arguments: list[str], **_kwargs: object) -> mock.Mock:
+            run_calls.append(arguments)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(
+            tmux_mouse, "list_key_command", side_effect=current_binding
+        ), mock.patch.object(
+            tmux_mouse, "default_key_commands", side_effect=defaults
+        ), mock.patch.object(
+            tmux_mouse.subprocess, "run", side_effect=fake_run
+        ):
+            self.assertTrue(tmux_mouse.restore_legacy_mouse_bindings())
+
+        self.assertIn(
+            [
+                "tmux",
+                "bind-key",
+                "-T",
+                "root",
+                "WheelUpPane",
+                "select-pane ; copy-mode -e",
+            ],
+            run_calls,
+        )
+        self.assertIn(
+            ["tmux", "unbind-key", "-T", "root", "WheelDownPane"], run_calls
+        )
 
     def test_detach_keeps_fresh_tmux_session_alive(self) -> None:
         run_calls: list[list[str]] = []
 
         def fake_run(arguments: list[str], **_kwargs: object) -> mock.Mock:
             run_calls.append(arguments)
-            if arguments[1] == "new-session":
+            if "new-session" in arguments:
                 return mock.Mock(stdout="%main\n", returncode=0)
-            if arguments[1] == "has-session":
+            if "split-window" in arguments:
+                return mock.Mock(stdout="%hud\n", returncode=0)
+            if "has-session" in arguments:
                 return mock.Mock(returncode=0)
             return mock.Mock(returncode=0, stdout="")
 
@@ -387,14 +1177,112 @@ class HudTest(unittest.TestCase):
             codex_hud_cli.subprocess, "run", side_effect=fake_run
         ), mock.patch.object(
             codex_hud_cli.subprocess, "call", return_value=0
+        ), mock.patch.object(
+            codex_hud_cli, "_native_terminal_mouse", return_value=True
         ):
             self.assertEqual(codex_hud_cli.launch([]), 0)
 
-        self.assertFalse(any(call[1] == "kill-session" for call in run_calls))
+        self.assertFalse(any("kill-session" in call for call in run_calls))
+        self.assertIn(
+            ["tmux", "-L", "codex-hud", "select-pane", "-d", "-t", "%hud"],
+            run_calls,
+        )
+        self.assertIn(
+            [
+                "tmux",
+                "-L",
+                "codex-hud",
+                "set-hook",
+                "-p",
+                "-t",
+                "%hud",
+                "after-select-pane",
+                "select-pane -t %main",
+            ],
+            run_calls,
+        )
+        self.assertFalse(any("bind-key" in call for call in run_calls))
+        create_call = next(call for call in run_calls if "new-session" in call)
+        self.assertEqual(create_call[:3], ["tmux", "-L", "codex-hud"])
+        self.assertIn("/dev/null", create_call)
+        self.assertIn("default-terminal", create_call)
+        self.assertIn("tmux-256color", create_call)
+        split_call = next(call for call in run_calls if "split-window" in call)
+        self.assertLess(split_call.index("-d"), split_call.index("-v"))
+        self.assertIn(
+            [
+                "tmux",
+                "-L",
+                "codex-hud",
+                "set-option",
+                "-t",
+                mock.ANY,
+                "mouse",
+                "off",
+            ],
+            run_calls,
+        )
         ready_files = list((Path(self.temporary.name) / "runs").glob(".*.ready"))
         detached_files = list((Path(self.temporary.name) / "runs").glob(".*.detached"))
         self.assertEqual(len(ready_files), 1)
         self.assertEqual(len(detached_files), 1)
+
+    def test_standalone_fallback_mouse_survives_detach_and_guards_hud(self) -> None:
+        run_calls: list[list[str]] = []
+
+        def fake_run(arguments: list[str], **_kwargs: object) -> mock.Mock:
+            run_calls.append(arguments)
+            if "new-session" in arguments:
+                return mock.Mock(stdout="%main\n", returncode=0)
+            if "split-window" in arguments:
+                return mock.Mock(stdout="%hud\n", returncode=0)
+            if "has-session" in arguments:
+                return mock.Mock(returncode=0)
+            return mock.Mock(returncode=0, stdout="")
+
+        environment = {
+            "CODEX_HUD_HOME": self.temporary.name,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        with mock.patch.object(
+            codex_hud_cli, "enabled", return_value=True
+        ), mock.patch.object(
+            codex_hud_cli, "_require"
+        ), mock.patch.object(
+            codex_hud_cli.os, "environ", environment
+        ), mock.patch.object(
+            codex_hud_cli.os, "getcwd", return_value=self.temporary.name
+        ), mock.patch.object(
+            codex_hud_cli.subprocess, "run", side_effect=fake_run
+        ), mock.patch.object(
+            codex_hud_cli.subprocess, "call", return_value=0
+        ), mock.patch.object(
+            codex_hud_cli, "_native_terminal_mouse", return_value=False
+        ):
+            self.assertEqual(codex_hud_cli.launch([]), 0)
+
+        self.assertIn(
+            [
+                "tmux", "-L", "codex-hud", "set-option", "-t",
+                mock.ANY, "mouse", "on",
+            ],
+            run_calls,
+        )
+        self.assertIn(
+            [
+                "tmux", "-L", "codex-hud", "set-option", "-p", "-t",
+                "%hud", "@is_hud", "1",
+            ],
+            run_calls,
+        )
+        self.assertIn(
+            [
+                "tmux", "-L", "codex-hud", "set-hook", "-p", "-t",
+                "%hud", "after-copy-mode",
+                'if-shell -F "#{@is_hud}" "copy-mode -q"',
+            ],
+            run_calls,
+        )
 
 
     def test_tools_active_sorted_by_recent(self) -> None:

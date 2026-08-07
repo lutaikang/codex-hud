@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - Windows fallback for future ports
 
 STATE_VERSION = 2
 HUD_LINES = 8
-HUD_VERSION = "0.3.0"
+HUD_VERSION = "0.3.13"
 
 
 def hud_home() -> Path:

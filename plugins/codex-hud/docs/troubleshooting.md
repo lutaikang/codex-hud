@@ -2,46 +2,50 @@
 
 ## HUD 没出现
 
-运行 `codex-hud status`，确认 HUD 已开启、`tmux` 可执行，然后必须用 `codex-hud run` 启动新会话。普通 `codex` 不会自动创建 pane。
+运行 `codex-hud status`，确认 HUD 已开启，然后必须从外部终端用 `codex-hud run` 启动新会话。macOS standalone Ghostty 不要求 tmux；已在 tmux 内或非 Ghostty 环境才需要 tmux fallback。
 
-## 鼠标滚轮无法滚动历史
+普通 `codex` 只会加载已安装的插件、Hook 和 Skill，不会自动创建 HUD surface。`codex-hud on` 也只保存启用偏好，不会改写 `codex` 命令。
 
-**独立 session（`codex-hud run` 创建）**：已自动启用 `mouse on`，滚轮在主 Codex 面板上可进入 copy-mode 浏览历史。HUD 面板区域（底部 8 行）通过 `bind-key` 排除滚轮捕获。
+## 不要在当前 Codex thread 内嵌套启动
 
-**嵌入已有 tmux**：需在当前窗口手动启用鼠标：`tmux set-option -w mouse on`。
+插件 Skill 可以执行 `on`、`off` 和 `status`，但不应在已运行的 Codex thread 内再启动交互式 `codex-hud run`。完整 HUD 需要在父 Codex 启动前注入 `--no-alt-screen` 和 `CODEX_HUD_RUN_ID`，嵌套会话也可能继承环境并干扰当前 thread 绑定。
 
-**指针位置**：滚轮事件按指针所在 pane 路由。确保鼠标在主 Codex 面板区域而非 HUD 面板区域。
+## 鼠标滚轮、选区或右键异常
+
+Codex 0.146 的兼容问题来自 alternate screen 与 tmux 鼠标事件路径。HUD wrapper 会添加官方 `--no-alt-screen`，使历史输出进入承载终端的 scrollback；普通无 HUD 的 Codex 启动保持原配置。
+
+**Ghostty/macOS standalone（`codex-hud run` 创建）**：不创建 tmux 主 session，而是使用 Ghostty 原生下方 split。主 Codex surface 保留 terminal scrollback，滚轮、拖选、释放保持和右键由 Ghostty 原生处理；HUD surface 为 read-only。
+
+**Ghostty/macOS 嵌入已有 tmux**：wrapper 会临时关闭当前 session 的 `mouse` 并保留兼容路径；由于外层 tmux 仍存在，该模式不能同时提供 standalone Ghostty 的完整滚轮、选区和右键语义。退出时恢复原来的显式或继承状态，同一 session 的其他窗口在运行期间也会暂时受 session 级 mouse 选项影响。需要完整原生行为时，请在 tmux 外启动。
+
+**已在 tmux 内或非 Ghostty/非 macOS**：保留 tmux fallback；该 fallback 只保证 tmux 能力范围内的历史滚动和 pane 生命周期，不宣称等同于 Ghostty standalone 的原生选区和 context menu。
+
+**升级后仍出现旧行为**：下一次嵌入式 `codex-hud run` 会仅迁移带 `@is_hud` / `@hud_main_pane` 标记的旧版绑定，恢复当前 tmux 默认绑定；用户自定义绑定不会被迁移。
 
 ## 高度不正确
 
-`codex-hud` 在创建 session 时用 `resize-pane -y 8` 固定 HUD 高度。终端窗口高度应 >= 10 行（主面板至少 2 行 + HUD 8 行）。窗口过小时 tmux 可能拒绝分配足够行数。
+tmux fallback 创建 HUD pane 时用 `split-window -l 8` 分配高度。Ghostty 原生 split 会读取实际 geometry 并动态校准、监控保持 8 行。窗口过小时，tmux 或 Ghostty 可能无法分配足够空间。
 
-## Context 与原生栏不一致
+## Context 与文档或旧版本不一致
 
-当前 HUD 使用 Codex transcript 中的原始 `model_context_window` 和 `total_tokens` 值，与 Codex 原生 TUI 的百分比口径一致。确认 Codex CLI 版本 >= 0.146。运行 `./scripts/verify.sh` 检查 fixture。
+当前实现不再扣除 12,000 token baseline，而是直接使用 transcript 的 raw `model_context_window` 和 `last_token_usage.total_tokens`。fixture `122880 / 258400` 的期望值是 `48% used`、`52% left`。
+
+本次审计环境为 Codex CLI 0.147.0。运行 `./scripts/verify.sh` 检查 fixture；升级 Codex 后若口径变化，需要同步更新实现、测试和 `docs/metrics-semantics.md`。
 
 ## 账号错误
 
 确认启动 wrapper 时的 `CODEX_HOME`。HUD 继承该变量并只读取该 home 的当前账号。切换账号后请新开 `codex-hud run` 会话。
 
-当前 Hook 协议没有提供稳定的 Codex 进程身份。插件会拒绝不同账号和不同 thread 的普通 `startup`，并允许同账号的合法 `clear` / `resume`；因此不要从受监控会话的工具命令里再嵌套执行 `codex resume`，它可能被解释为当前 TUI 的合法恢复切换。
+当前 Hook 协议没有提供稳定的 Codex 进程身份。插件会拒绝不同账号和不同 thread 的普通 `startup`，并允许同账号的合法 `clear` / `resume`；因此不要从受监控会话的工具命令里再嵌套执行 `codex resume`。
 
 ## 嵌套 tmux
 
-在已有 tmux 内运行时，HUD 只分割当前 pane，不关闭现有 tmux status。终端高度不足 10 行时，tmux 可能拒绝创建 8 行 pane。嵌入模式下鼠标滚轮需手动启用（见上方）。
+在已有 tmux 内运行时，HUD 只分割当前 pane，不关闭现有 tmux status。终端高度不足 10 行时，tmux 可能拒绝创建 8 行 pane。tmux 的 `mouse` 是 session 级选项，因此嵌入式 HUD 运行期间，同 session 的其他窗口可能暂时受到影响。
 
-## 性能
+## 账号或限额暂时显示未知
 
-渲染器每秒轮询 transcript 和状态，正常 CPU < 1%。修改源码后删除 `__pycache__` 确保新代码生效。
+HUD 首帧不会等待 `codex app-server`。renderer 在后台读取账号和 rate limits，并按约 60 秒刷新；App Server 暂时失败时，面板继续运行，账号或限额会显示 loading/unknown，而不会阻塞 Codex。
 
 ## 关闭
 
 `codex-hud off` 会让活动 renderer 在下一次刷新退出，但不会终止 Codex，也不会修改原生 `tui.status_line`。
-
-## 重置
-
-```bash
-codex-hud off
-rm -rf ~/.codex-hud   # 可选：清理本地状态
-./scripts/install.sh
-```

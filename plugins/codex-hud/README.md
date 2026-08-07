@@ -1,6 +1,6 @@
 # Codex HUD
 
-`codex-hud` 是一个本地、可开关、可复用的 Codex CLI 8 行实时监控面板。它在 tmux 下方显示当前会话状态，保留 Codex 原生单行状态栏。
+`codex-hud` 是一个本地、可开关、可复用的 Codex CLI 8 行实时监控面板。macOS standalone Ghostty 使用原生 split 在 Codex 下方显示 HUD；已在 tmux 内或非 Ghostty 环境才使用 tmux pane，保留 Codex 原生单行状态栏。
 
 ```
 HUD ● working  [gpt-5.6-sol · xhigh]  acct:me/plus  git:(feat/hud*)  ⏱ 1h 02m  ≈$7.22
@@ -13,11 +13,17 @@ SKILLS ◐ brainstorming 30s · ✓ ×3
 TODO   8/12  ◐ 当前任务名
 ```
 
-面板严格占 8 行；渲染末尾不输出换行，因此不会滚出空白行。`codex-hud` 在 session 创建时用 `resize-pane` 锁定 HUD 面板高度。窄终端通过 ANSI 与 CJK 字符宽度安全裁剪内容，不自动换行。
+面板严格占 8 行；渲染末尾不输出换行，因此不会滚出空白行。tmux fallback 创建 HUD pane 时使用 `split-window -l 8`；Ghostty 原生 split 启动后由 geometry monitor 动态校准到 8 行。窄终端通过 ANSI 与 CJK 字符宽度安全裁剪内容，不自动换行。
 
-## 为什么采用 tmux 侧车面板
+## 为什么采用终端侧车面板
 
-Codex 官方 `tui.status_line` 只接受有序的原生标识符，适合保留单行状态；它没有插件可写的多行区域。HUD 因此采用 tmux 侧车 pane：生命周期与 Codex 进程绑定，插件不用 patch TUI，升级失败时也可直接关闭。详细设计见 `docs/architecture.md`。
+Codex 官方 `tui.status_line` 只接受有序的原生标识符，适合保留单行状态；它没有插件可写的多行区域。HUD 因此采用独立的终端侧车 surface：Ghostty standalone 使用原生 split，其他环境使用 tmux pane。生命周期与 Codex 进程绑定，插件不用 patch TUI，升级失败时也可直接关闭。详细设计见 `docs/architecture.md`。
+
+## 插件与启动 wrapper 的边界
+
+Codex 插件负责安装和启用 manifest、生命周期 Hook 与 `codex-hud` Skill。Hook 只在 wrapper 预先注入 `CODEX_HUD_RUN_ID` 时采集当前会话，避免插件启用后误收普通 Codex 会话。
+
+终端布局必须在 Codex 启动前决定：wrapper 需要注入 `--no-alt-screen`、设置运行 ID，并成为 Ghostty split 或 tmux pane 的生命周期 owner。当前 Codex 插件接口没有 pre-launch wrapper 或多行 TUI surface 扩展点，所以普通 `codex` 不会自动创建 HUD。请在外部终端运行 `codex-hud run`，不要从已运行的 Codex thread 内启动嵌套交互会话。完整分析见 `docs/plugin-startup-analysis.md`。
 
 ## 功能清单
 
@@ -32,14 +38,15 @@ Codex 官方 `tui.status_line` 只接受有序的原生标识符，适合保留�
 - `update_plan` Todo 完成度及当前项
 - 缓存输入占全部输入的中性比率
 - 基于内置参考单价的 API 等价成本估算（不是订阅账单）
-- 鼠标滚轮：主面板可滚动历史输出，HUD 面板不捕获滚轮
+- 历史输出滚轮：Ghostty standalone 使用 Codex 官方 inline 模式保留 scrollback，由 Ghostty 原生滚动；tmux fallback 使用 tmux 能力范围内的历史滚动
 - `on` / `off` / `toggle` 自定义开关
 
 ## 前置条件
 
-- Codex CLI 0.146 或兼容版本
+- Codex CLI 0.146+（本次文档漂移审计使用 0.147.0）
 - Python 3.10+
-- tmux 3.x（macOS、Linux 或 WSL）
+- tmux 3.x（仅已在 tmux 内或非 Ghostty/非 macOS fallback 需要）
+- macOS standalone Ghostty 可使用原生 split，不要求 tmux 承载主 Codex surface
 - 终端需支持 UTF-8，颜色可用 `NO_COLOR=1` 关闭
 
 ## 从源码仓库安装
@@ -77,13 +84,17 @@ codex-hud run      # 在 HUD 布局中启动 Codex
 codex-hud run -- -C /path/to/repo --search
 ```
 
+`codex-hud on` 只保存启用偏好，不会改写 `codex` 命令。新会话仍需从外部终端通过 `codex-hud run` 启动。
+
 关闭 HUD 不会关闭原生单行状态栏。原生栏由用户自己的 `~/.codex/config.toml` 中 `tui.status_line` 管理，本项目不会重写该配置。
 
 ## 鼠标滚轮
 
-`codex-hud run` 创建的独立 tmux session 启用 `mouse on`。在主 Codex 面板上滚动鼠标滚轮可进入 tmux copy-mode 浏览历史输出。HUD 面板（底部 8 行）通过 `bind-key` 排除了滚轮捕获——滚轮事件落在 HUD 区域时被静默丢弃，不会进入无意义的 copy-mode。
+Codex 0.146 默认使用 alternate screen；tmux 开启 mouse 后，默认 `WheelUpPane` 会把滚轮作为原始鼠标事件发给 Codex，但 Codex TUI 明确忽略 mouse event，因此不能形成历史滚动。`codex-hud run` 只在 HUD 包装路径注入 Codex 官方 `--no-alt-screen`，让主对话按官方 inline 模式写入承载终端的 scrollback；未启用 HUD 的普通 `codex` 不受影响。
 
-如需在嵌入已有 tmux 的模式下也使用鼠标滚轮，请在当前 tmux 窗口中手动启用 `mouse on`。
+**Ghostty/macOS standalone**：wrapper 不创建 tmux 主 session，而是通过 Ghostty 原生 split 创建 HUD surface；Codex 使用官方 `--no-alt-screen`，历史输出留在 Ghostty terminal scrollback，滚轮、拖选、释放保持和右键菜单由 Ghostty 原生处理。HUD surface 原生 read-only，且由 geometry monitor 动态保持 8 行。目标 terminal 通过唯一 OSC 7 working-directory marker 定位，避免多窗口时误选 front window。
+
+**已在 tmux 内或非 Ghostty/非 macOS**：使用 tmux fallback。该路径只能在 tmux 能力范围内提供滚动和 pane 生命周期，不能宣称等同 Ghostty standalone 的原生选区和 context menu；退出时会恢复原有 session mouse 设置。
 
 ## 数据与隐私边界
 
@@ -98,4 +109,4 @@ codex-hud run -- -C /path/to/repo --search
 codex-hud status
 ```
 
-常见问题、tmux 内外启动差异及账号边界见插件包内的 `docs/troubleshooting.md`。指标口径见 `docs/metrics-semantics.md`，主题与终端兼容策略见 `docs/themes.md`。
+常见问题、tmux 内外启动差异及账号边界见插件包内的 `docs/troubleshooting.md`。指标口径见 `docs/metrics-semantics.md`，插件启动边界见 `docs/plugin-startup-analysis.md`，主题与终端兼容策略见 `docs/themes.md`。

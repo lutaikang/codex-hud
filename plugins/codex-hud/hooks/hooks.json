@@ -1,5 +1,5 @@
 {
-  "description": "Collect local telemetry for the optional Codex tmux HUD.",
+  "description": "Collect local telemetry for the optional Codex HUD.",
   "hooks": {
     "SessionStart": [
       {
