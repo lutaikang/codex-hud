@@ -102,6 +102,192 @@ class HudTest(unittest.TestCase):
         self.assertEqual(state["plan"][1]["status"], "in_progress")
         self.assertEqual(state["agents"]["agent-1"]["status"], "running")
 
+    def test_empty_update_plan_clears_stale_plan(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "tool_name": "update_plan",
+                "tool_use_id": "tool-1",
+                "tool_input": {
+                    "plan": [{"step": "Old task", "status": "in_progress"}]
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": "turn-2",
+                "tool_name": "update_plan",
+                "tool_use_id": "tool-2",
+                "tool_input": {"plan": []},
+            },
+            self.run_id,
+        )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["plan"], [])
+        self.assertEqual(state["plan_state"], "empty")
+
+    def test_stop_marks_incomplete_plan_stale_without_completing(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "tool_name": "update_plan",
+                "tool_use_id": "tool-1",
+                "tool_input": {
+                    "plan": [
+                        {"step": "Done", "status": "completed"},
+                        {"step": "Pending", "status": "pending"},
+                    ]
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+            },
+            self.run_id,
+        )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["plan"][1]["status"], "pending")
+        self.assertEqual(state["plan_state"], "stale")
+
+    def test_same_turn_user_prompt_does_not_stale_active_plan(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "tool_name": "update_plan",
+                "tool_input": {
+                    "plan": [{"step": "Continue", "status": "in_progress"}]
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+            },
+            self.run_id,
+        )
+
+        self.assertEqual(hud_state.load_state(self.run_id)["plan_state"], "active")
+
+    def test_session_end_marks_incomplete_plan_stale(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "tool_name": "update_plan",
+                "tool_input": {
+                    "plan": [{"step": "Interrupted", "status": "pending"}]
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {"hook_event_name": "SessionEnd", "session_id": "thread-1"},
+            self.run_id,
+        )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["status"], "ended")
+        self.assertEqual(state["plan_state"], "stale")
+
+    def test_new_plan_update_reactivates_stale_plan(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "tool_name": "update_plan",
+                "tool_use_id": "tool-1",
+                "tool_input": {
+                    "plan": [{"step": "Pending", "status": "pending"}]
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": "turn-2",
+                "tool_name": "update_plan",
+                "tool_use_id": "tool-2",
+                "tool_input": {
+                    "plan": [{"step": "Now", "status": "in_progress"}]
+                },
+            },
+            self.run_id,
+        )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["plan_state"], "active")
+        self.assertEqual(state["plan_turn_id"], "turn-2")
+
     def test_session_start_resets_stale_launcher_timestamp(self) -> None:
         hud_state.update_state(
             self.run_id,
@@ -300,9 +486,136 @@ class HudTest(unittest.TestCase):
             {},
         )
         output = "\n".join(lines)
-        self.assertEqual(len(lines), 8)
+        self.assertEqual(len(lines), 9)
         for section in ("acct:me/plus", "CTX", "CACHE", "TOOLS", "AGENTS", "SKILLS", "TODO"):
             self.assertIn(section, output)
+
+    def test_render_shows_unfinished_plan_items_and_overflow(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update(
+            {
+                "cwd": self.temporary.name,
+                "plan": [
+                    {"step": "Already done", "status": "completed"},
+                    {"step": "Current task", "status": "in_progress"},
+                    {"step": "Next task", "status": "pending"},
+                    {"step": "Later task", "status": "pending"},
+                ],
+                "plan_state": "stale",
+            }
+        )
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        self.assertEqual(len(lines), 10)
+        output = "\n".join(lines)
+        self.assertIn("3 未执行", output)
+        self.assertIn("计划未同步", output)
+        self.assertIn("Current task", output)
+        self.assertIn("Next task", output)
+        self.assertIn("+1", output)
+
+    def test_invalid_plan_item_never_reports_all_completed(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update(
+            {
+                "cwd": self.temporary.name,
+                "plan": [{"step": 123, "status": "pending"}],
+                "plan_state": "active",
+            }
+        )
+
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        self.assertNotIn("全部完成", lines[7])
+        self.assertIn("1 未完成", lines[7])
+
+    def test_small_geometry_preserves_todo_summary(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update(
+            {
+                "cwd": self.temporary.name,
+                "plan": [{"step": "Keep visible", "status": "pending"}],
+                "plan_state": "active",
+            }
+        )
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        visible = hud_render.fit_lines_for_geometry(lines, 7)
+        self.assertEqual(len(visible), 7)
+        self.assertIn("TODO", "\n".join(visible))
+        self.assertNotIn("Keep visible", "\n".join(visible))
+
+    def test_plan_detail_preserves_overflow_suffix_when_clipped(self) -> None:
+        item = {"step": "B" * 240, "status": "pending"}
+        line = hud_render.plan_detail_line(item, 1, 3, 80)
+
+        self.assertIn("… +1", line)
+
+    def test_render_stays_eight_lines_when_plan_is_complete(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update(
+            {
+                "cwd": self.temporary.name,
+                "plan": [
+                    {"step": "First", "status": "completed"},
+                    {"step": "Second", "status": "completed"},
+                ],
+                "plan_state": "completed",
+            }
+        )
+
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+        self.assertEqual(len(lines), 8)
+        self.assertIn("2/2", lines[7])
+        self.assertIn("全部完成", lines[7])
+
+    def test_desired_hud_lines_tracks_unfinished_task_count(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        self.assertEqual(hud_state.desired_hud_lines(state), 8)
+        state["plan"] = [{"step": "One", "status": "pending"}]
+        self.assertEqual(hud_state.desired_hud_lines(state), 9)
+        state["plan"] = [
+            {"step": "One", "status": "in_progress"},
+            {"step": "Two", "status": "pending"},
+            {"step": "Three", "status": "pending"},
+        ]
+        self.assertEqual(hud_state.desired_hud_lines(state), 10)
+
+    def test_renderer_resizes_its_tmux_pane_to_dynamic_target(self) -> None:
+        os.environ["TMUX_PANE"] = "%hud"
+        try:
+            with mock.patch.object(hud_render.subprocess, "run") as run:
+                run.return_value.returncode = 0
+                self.assertTrue(hud_render.resize_tmux_surface(10))
+        finally:
+            os.environ.pop("TMUX_PANE", None)
+
+        run.assert_called_once_with(
+            ["tmux", "resize-pane", "-t", "%hud", "-y", "10"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     def test_api_render_exposes_usage_and_marks_estimate(self) -> None:
         state = hud_state.default_state(self.run_id)
@@ -549,12 +862,16 @@ class HudTest(unittest.TestCase):
             )
 
         resize.assert_called_once_with(
-            "main-terminal", "hud-terminal", mock.ANY, 2.0
+            "main-terminal",
+            "hud-terminal",
+            mock.ANY,
+            2.0,
+            hud_state.HUD_MIN_LINES,
         )
         make_readonly.assert_called_once_with("hud-terminal")
         focus_terminal.assert_called_once_with("main-terminal")
         start_monitor.assert_called_once_with(
-            "main-terminal", "hud-terminal", mock.ANY, 2.0
+            "main-terminal", "hud-terminal", mock.ANY, 2.0, "native-run"
         )
         resize_stop.set.assert_called_once_with()
         resize_thread.join.assert_called_once_with(timeout=12.0)
@@ -842,6 +1159,12 @@ class HudTest(unittest.TestCase):
             codex_hud_cli._ghostty_resize_action(
                 {"rows": hud_state.HUD_LINES, "height_pixels": 272}, 2.0
             )
+        )
+        self.assertEqual(
+            codex_hud_cli._ghostty_resize_action(
+                {"rows": 8, "height_pixels": 272}, 2.0, target_lines=10
+            ),
+            "resize_split:up,34",
         )
 
     def test_renderer_reports_terminal_rows_and_pixels_for_native_resize(self) -> None:
