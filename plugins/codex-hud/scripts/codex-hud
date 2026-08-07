@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enable, disable, and launch Codex with a local eight-line HUD."""
+"""Enable, disable, and launch Codex with a local dynamic HUD."""
 
 from __future__ import annotations
 
@@ -18,7 +18,16 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from hud_state import enabled, hud_home, mark_ended, remove_run, set_enabled, HUD_LINES
+from hud_state import (
+    HUD_MIN_LINES,
+    desired_hud_lines,
+    enabled,
+    hud_home,
+    load_state,
+    mark_ended,
+    remove_run,
+    set_enabled,
+)
 from tmux_mouse import (
     acquire_tmux_mouse as _acquire_tmux_mouse,
     acquire_native_mouse as _acquire_native_mouse,
@@ -34,6 +43,7 @@ NATIVE_HUD_READY_TIMEOUT = 10.0
 NATIVE_HUD_RESIZE_TIMEOUT = 8.0
 NATIVE_HUD_APPLESCRIPT_TIMEOUT = 15.0
 NATIVE_HUD_RESIZE_ACTION_TIMEOUT = 3.0
+NATIVE_HUD_HEARTBEAT_TIMEOUT = 3.0
 _GHOSTTY_SCRIPT_LOCK = threading.RLock()
 
 
@@ -358,7 +368,7 @@ def _read_terminal_geometry(path: Path) -> dict[str, int] | None:
 def _ghostty_resize_action(
     geometry: dict[str, int],
     backing_scale: float,
-    target_lines: int = HUD_LINES,
+    target_lines: int = HUD_MIN_LINES,
 ) -> str | None:
     rows = geometry.get("rows", 0)
     if rows <= 0 or rows == target_lines:
@@ -412,6 +422,7 @@ def _ghostty_resize_hud(
     hud_terminal: str,
     geometry_path: Path,
     backing_scale: float,
+    target_lines: int = HUD_MIN_LINES,
 ) -> bool:
     deadline = time.monotonic() + NATIVE_HUD_RESIZE_TIMEOUT
     geometry = _wait_for_geometry(geometry_path, deadline)
@@ -419,14 +430,14 @@ def _ghostty_resize_hud(
     for _ in range(8):
         if geometry is None:
             return False
-        action = _ghostty_resize_action(geometry, current_scale)
+        action = _ghostty_resize_action(geometry, current_scale, target_lines)
         if action is None:
-            return geometry.get("rows") == HUD_LINES
+            return geometry.get("rows") == target_lines
         # Do not start another AppleScript action once the overall resize
         # deadline has elapsed.  An action can itself block for up to three
         # seconds; allowing new actions here made cleanup outlive its bound.
         if time.monotonic() >= deadline:
-            return geometry.get("rows") == HUD_LINES
+            return geometry.get("rows") == target_lines
         try:
             amount = int(action.rsplit(",", 1)[1])
         except (IndexError, ValueError):
@@ -438,7 +449,7 @@ def _ghostty_resize_hud(
             final_geometry = _read_terminal_geometry(geometry_path)
             return bool(
                 final_geometry is not None
-                and final_geometry.get("rows") == HUD_LINES
+                and final_geometry.get("rows") == target_lines
             )
         geometry = _wait_for_geometry(
             geometry_path,
@@ -457,34 +468,57 @@ def _ghostty_resize_hud(
             )
             if observed > 0:
                 current_scale = max(0.5, min(8.0, observed / amount))
-    return geometry is not None and geometry.get("rows") == HUD_LINES
+    return geometry is not None and geometry.get("rows") == target_lines
 
 
 def _maintain_ghostty_hud_size(
     main_terminal: str,
     hud_terminal: str,
     geometry_path: Path,
+    heartbeat_path: Path,
     backing_scale: float,
+    run_id: str,
     stop_event: threading.Event,
 ) -> None:
+    failure_count = 0
     while not stop_event.wait(0.25):
+        if not enabled():
+            return
+        try:
+            if time.time() - heartbeat_path.stat().st_mtime > NATIVE_HUD_HEARTBEAT_TIMEOUT:
+                return
+        except OSError:
+            return
         geometry = _read_terminal_geometry(geometry_path)
-        if geometry is None or geometry.get("rows") == HUD_LINES:
+        target_lines = desired_hud_lines(load_state(run_id))
+        if geometry is None or geometry.get("rows") == target_lines:
+            failure_count = 0
             continue
         try:
             if not _ghostty_resize_hud(
-                main_terminal, hud_terminal, geometry_path, backing_scale
+                main_terminal,
+                hud_terminal,
+                geometry_path,
+                backing_scale,
+                target_lines,
             ):
-                return
+                failure_count += 1
+            else:
+                failure_count = 0
         except Exception:
+            failure_count += 1
+        if failure_count >= 5:
             return
+        stop_event.wait(min(8.0, 2.0 ** failure_count))
 
 
 def _start_ghostty_size_monitor(
     main_terminal: str,
     hud_terminal: str,
     geometry_path: Path,
+    heartbeat_path: Path,
     backing_scale: float,
+    run_id: str,
 ) -> tuple[threading.Event, threading.Thread]:
     stop_event = threading.Event()
     thread = threading.Thread(
@@ -493,7 +527,9 @@ def _start_ghostty_size_monitor(
             main_terminal,
             hud_terminal,
             geometry_path,
+            heartbeat_path,
             backing_scale,
+            run_id,
             stop_event,
         ),
         name="codex-hud-ghostty-resize",
@@ -520,6 +556,7 @@ def _launch_native_ghostty(
 ) -> int:
     ready_path = hud_home() / "runs" / f".{run_id}.ghostty-ready"
     geometry_path = hud_home() / "runs" / f".{run_id}.ghostty-geometry.json"
+    heartbeat_path = hud_home() / "runs" / f".{run_id}.ghostty-heartbeat"
     target_directory = hud_home() / "runs" / f".{run_id}.ghostty-target"
     hud_directory = hud_home() / "runs" / f".{run_id}.ghostty-hud"
     working_directory = os.getcwd()
@@ -528,6 +565,7 @@ def _launch_native_ghostty(
     hud_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     _unlink(ready_path)
     _unlink(geometry_path)
+    _unlink(heartbeat_path)
     termination_handlers = _install_termination_handlers()
     hud_terminal: str | None = None
     hud_started = False
@@ -564,11 +602,22 @@ def _launch_native_ghostty(
             if not _wait_for_path(ready_path, NATIVE_HUD_READY_TIMEOUT):
                 raise RuntimeError("native HUD startup timed out")
             if not _ghostty_resize_hud(
-                main_terminal, hud_terminal, geometry_path, backing_scale
+                main_terminal,
+                hud_terminal,
+                geometry_path,
+                backing_scale,
+                HUD_MIN_LINES,
             ):
-                raise RuntimeError(f"native HUD could not reach {HUD_LINES} rows")
+                raise RuntimeError(
+                    f"native HUD could not reach {HUD_MIN_LINES} rows"
+                )
             resize_stop, resize_thread = _start_ghostty_size_monitor(
-                main_terminal, hud_terminal, geometry_path, backing_scale
+                main_terminal,
+                hud_terminal,
+                geometry_path,
+                heartbeat_path,
+                backing_scale,
+                run_id,
             )
         except Exception as error:
             _close_native_hud(hud_terminal, hud_directory, split_attempted)
@@ -607,6 +656,7 @@ def _launch_native_ghostty(
             _remove_run(run_id)
             _unlink(ready_path)
             _unlink(geometry_path)
+            _unlink(heartbeat_path)
             _best_effort(target_directory.rmdir)
             _best_effort(hud_directory.rmdir)
         finally:
@@ -672,6 +722,8 @@ def launch(arguments: list[str]) -> int:
                 str(hud_home() / "runs" / f".{run_id}.ghostty-ready"),
                 "--geometry-file",
                 str(hud_home() / "runs" / f".{run_id}.ghostty-geometry.json"),
+                "--heartbeat-file",
+                str(hud_home() / "runs" / f".{run_id}.ghostty-heartbeat"),
             ]
         )
         return _launch_native_ghostty(
@@ -693,7 +745,7 @@ def launch(arguments: list[str]) -> int:
                     "-d",
                     "-v",
                     "-l",
-                    str(HUD_LINES),
+                    str(HUD_MIN_LINES),
                     "-t",
                     current_pane,
                     "-P",
@@ -819,7 +871,7 @@ def launch(arguments: list[str]) -> int:
                     "-d",
                     "-v",
                     "-l",
-                    str(HUD_LINES),
+                    str(HUD_MIN_LINES),
                     "-t",
                     main_pane,
                     "-c",

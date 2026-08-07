@@ -21,7 +21,16 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from hud_state import enabled, load_state, HUD_LINES, HUD_VERSION
+from hud_state import (
+    HUD_MAX_LINES,
+    HUD_MIN_LINES,
+    HUD_VERSION,
+    desired_hud_lines,
+    enabled,
+    load_state,
+    plan_projection,
+    unfinished_plan_items,
+)
 from metrics import official_context_usage
 
 
@@ -60,6 +69,24 @@ def terminal_geometry(file_descriptor: int) -> dict[str, int]:
     }
 
 
+def resize_tmux_surface(target_lines: int) -> bool:
+    """Resize the renderer's own tmux pane, if this HUD uses tmux fallback."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return True
+    target = max(HUD_MIN_LINES, min(HUD_MAX_LINES, int(target_lines)))
+    try:
+        result = subprocess.run(
+            ["tmux", "resize-pane", "-t", pane, "-y", str(target)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 def _write_private_json(path: Path, value: dict[str, int]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(
@@ -83,6 +110,7 @@ def _touch_private(path: Path) -> None:
         os.fchmod(descriptor, 0o600)
     finally:
         os.close(descriptor)
+    os.utime(path, None)
 
 
 def color(name: str, text: str) -> str:
@@ -139,6 +167,45 @@ def visible_clip(text: str, width: int) -> str:
     if not os.environ.get("NO_COLOR"):
         output.append(RESET)
     return "".join(output)
+
+
+def _visible_width(text: str) -> int:
+    columns = 0
+    index = 0
+    while index < len(text):
+        match = ANSI_RE.match(text, index)
+        if match:
+            index = match.end()
+            continue
+        character = text[index]
+        columns += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        index += 1
+    return columns
+
+
+def plan_detail_line(
+    item: dict[str, Any], index: int, total: int, width: int
+) -> str:
+    status = item.get("status")
+    marker = "◐" if status == "in_progress" else "?" if status == "unknown" else "○"
+    prefix = f"       {color('yellow', marker)} "
+    visible_count = min(2, total)
+    overflow = total - visible_count if index == visible_count - 1 else 0
+    suffix = f"  … +{overflow}" if overflow > 0 else ""
+    available = max(1, width - _visible_width(prefix) - _visible_width(suffix))
+    step = str(item.get("step") or "未命名任务")
+    return prefix + visible_clip(step, available) + suffix
+
+
+def fit_lines_for_geometry(lines: list[str], rows: int) -> list[str]:
+    """Keep the TODO summary visible when a surface is temporarily too short."""
+    target = max(1, int(rows))
+    if len(lines) <= target:
+        return lines
+    todo_index = 7 if len(lines) > 7 else len(lines) - 1
+    if target == 1:
+        return [lines[todo_index]]
+    return [*lines[: target - 1], lines[todo_index]]
 
 
 def format_reset(timestamp: Any) -> str:
@@ -502,6 +569,7 @@ def render_lines(
     account: dict[str, Any],
     limits: dict[str, Any],
     account_loaded: bool = True,
+    width: int | None = None,
 ) -> list[str]:
     now = time.time()
     model = scanner.model or state.get("model") or "model --"
@@ -681,34 +749,32 @@ def render_lines(
         " · ".join(seventh_parts) if seventh_parts else "--"
     )
 
-    plan = state.get("plan") if isinstance(state.get("plan"), list) else []
-    completed = sum(1 for item in plan if isinstance(item, dict) and item.get("status") == "completed")
-    current = next(
-        (
-            str(item.get("step"))
-            for item in plan
-            if isinstance(item, dict) and item.get("status") in {"in_progress", "inProgress"}
-        ),
-        None,
-    )
-    if current is None:
-        current = next(
-            (
-                str(item.get("step"))
-                for item in plan
-                if isinstance(item, dict) and item.get("status") == "pending"
-            ),
-            None,
-        )
+    projection = plan_projection(state.get("plan"))
+    plan = projection["items"]
+    completed = projection["completed"]
+    unfinished = projection["unfinished"]
+    plan_state = str(state.get("plan_state") or "active")
     eighth = f"{color('cyan', 'TODO')} {completed}/{len(plan)}"
-    if current:
-        eighth += f"  {color('yellow', '◐')} {current}"
+    if unfinished:
+        eighth += f" · {len(unfinished)} 未完成"
+        if plan_state == "stale":
+            eighth += f" · {color('yellow', '⚠ 计划未同步')}"
+        elif projection["in_progress"]:
+            eighth += f" · {color('yellow', '◐ 执行中')}"
+        else:
+            eighth += f" · {color('yellow', '○ 待执行')}"
     elif plan:
-        eighth += f"  {color('green', '✓')} 全部完成"
+        eighth += f"  {color('green', '✓ 全部完成')}"
     else:
         eighth += "  · --"
 
-    return [first, second, third, fourth, fifth, sixth, seventh, eighth]
+    detail_lines: list[str] = []
+    for index, item in enumerate(unfinished[:2]):
+        detail_lines.append(
+            plan_detail_line(item, index, len(unfinished), width or 10_000)
+        )
+
+    return [first, second, third, fourth, fifth, sixth, seventh, eighth, *detail_lines]
 
 
 def main() -> int:
@@ -717,6 +783,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--ready-file")
     parser.add_argument("--geometry-file")
+    parser.add_argument("--heartbeat-file")
     args = parser.parse_args()
 
     scanner = TranscriptScanner()
@@ -739,35 +806,47 @@ def main() -> int:
                 account, limits, account_loaded = account_poller.snapshot()
             else:
                 account, limits, account_loaded = {}, {}, False
+            try:
+                geometry = terminal_geometry(sys.stdout.fileno())
+            except (OSError, ValueError):
+                geometry = {
+                    "rows": HUD_MIN_LINES,
+                    "columns": shutil.get_terminal_size((120, HUD_MIN_LINES)).columns,
+                    "width_pixels": 0,
+                    "height_pixels": 0,
+                }
+            if not args.once and os.environ.get("TMUX_PANE"):
+                target_lines = desired_hud_lines(state)
+                if geometry["rows"] != target_lines and resize_tmux_surface(target_lines):
+                    try:
+                        geometry = terminal_geometry(sys.stdout.fileno())
+                    except (OSError, ValueError):
+                        pass
+            width = max(1, geometry["columns"])
             lines = render_lines(
                 state,
                 scanner,
                 account,
                 limits,
                 account_loaded=account_loaded,
+                width=width,
             )
-            try:
-                geometry = terminal_geometry(sys.stdout.fileno())
-            except (OSError, ValueError):
-                geometry = {
-                    "rows": HUD_LINES,
-                    "columns": shutil.get_terminal_size((120, HUD_LINES)).columns,
-                    "width_pixels": 0,
-                    "height_pixels": 0,
-                }
             if args.geometry_file and geometry != last_geometry:
                 _write_private_json(Path(args.geometry_file), geometry)
                 last_geometry = geometry
-            width = max(1, geometry["columns"])
-            clipped = [visible_clip(line, width) for line in lines]
+            visible_lines = lines if args.once else fit_lines_for_geometry(lines, geometry["rows"])
+            clipped = [visible_clip(line, width) for line in visible_lines]
             if args.once:
                 print("\n".join(clipped))
                 if args.ready_file:
                     _touch_private(Path(args.ready_file))
                 return 0
-            # Exactly HUD_LINES rows and no trailing newline: the HUD does not scroll.
+            # The renderer never writes beyond the current surface while a dynamic
+            # resize is in flight, so the HUD does not scroll.
             sys.stdout.write("\033[H\033[2J" + "\n".join(clipped))
             sys.stdout.flush()
+            if args.heartbeat_file:
+                _touch_private(Path(args.heartbeat_file))
             if args.ready_file and not ready_written:
                 _touch_private(Path(args.ready_file))
                 ready_written = True

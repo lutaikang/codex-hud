@@ -513,7 +513,7 @@ class HudTest(unittest.TestCase):
 
         self.assertEqual(len(lines), 10)
         output = "\n".join(lines)
-        self.assertIn("3 未执行", output)
+        self.assertIn("3 未完成", output)
         self.assertIn("计划未同步", output)
         self.assertIn("Current task", output)
         self.assertIn("Next task", output)
@@ -565,6 +565,28 @@ class HudTest(unittest.TestCase):
         line = hud_render.plan_detail_line(item, 1, 3, 80)
 
         self.assertIn("… +1", line)
+
+    def test_render_width_passes_through_to_plan_detail(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update(
+            {
+                "cwd": self.temporary.name,
+                "plan": [
+                    {"step": "Current", "status": "in_progress"},
+                    {"step": "B" * 240, "status": "pending"},
+                    {"step": "Later", "status": "pending"},
+                ],
+            }
+        )
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+            width=80,
+        )
+
+        self.assertIn("… +1", lines[9])
 
     def test_render_stays_eight_lines_when_plan_is_complete(self) -> None:
         state = hud_state.default_state(self.run_id)
@@ -871,7 +893,12 @@ class HudTest(unittest.TestCase):
         make_readonly.assert_called_once_with("hud-terminal")
         focus_terminal.assert_called_once_with("main-terminal")
         start_monitor.assert_called_once_with(
-            "main-terminal", "hud-terminal", mock.ANY, 2.0, "native-run"
+            "main-terminal",
+            "hud-terminal",
+            mock.ANY,
+            mock.ANY,
+            2.0,
+            "native-run",
         )
         resize_stop.set.assert_called_once_with()
         resize_thread.join.assert_called_once_with(timeout=12.0)
@@ -1123,6 +1150,31 @@ class HudTest(unittest.TestCase):
                 )
             )
         apply_resize.assert_not_called()
+
+    def test_ghostty_monitor_stops_when_renderer_heartbeat_is_stale(self) -> None:
+        heartbeat = Path(self.temporary.name) / "heartbeat"
+        heartbeat.touch()
+        os.utime(heartbeat, (1, 1))
+        stop_event = mock.Mock()
+        stop_event.wait.return_value = False
+
+        with mock.patch.object(codex_hud_cli, "enabled", return_value=True), mock.patch.object(
+            codex_hud_cli, "_read_terminal_geometry"
+        ) as read_geometry, mock.patch.object(
+            codex_hud_cli, "_ghostty_resize_hud"
+        ) as resize:
+            codex_hud_cli._maintain_ghostty_hud_size(
+                "main",
+                "hud",
+                Path(self.temporary.name) / "geometry.json",
+                heartbeat,
+                2.0,
+                "run",
+                stop_event,
+            )
+
+        read_geometry.assert_not_called()
+        resize.assert_not_called()
 
     def test_ghostty_working_directory_marker_is_encoded_and_invisible(self) -> None:
         output = mock.Mock()

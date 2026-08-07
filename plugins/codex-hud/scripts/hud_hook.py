@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any
 
-from hud_state import enabled, update_state
+from hud_state import enabled, normalize_plan, plan_state_for, update_state
 
 
 JSON_OUTPUT_EVENTS = {"Stop", "SubagentStop"}
@@ -31,17 +31,25 @@ def _tool_key(event: dict[str, Any]) -> str:
 
 
 def _normalize_plan(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    plan: list[dict[str, str]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        step = item.get("step")
-        status = item.get("status")
-        if isinstance(step, str) and isinstance(status, str):
-            plan.append({"step": step[:240], "status": status})
-    return plan[:100]
+    """Compatibility wrapper for callers that imported the old helper."""
+    return normalize_plan(value)
+
+
+def _record_plan(
+    state: dict[str, Any],
+    tool_input: Any,
+    event: dict[str, Any],
+    now: float,
+) -> None:
+    if not isinstance(tool_input, dict) or "plan" not in tool_input:
+        return
+    plan = _normalize_plan(tool_input.get("plan"))
+    if state.get("plan") != plan:
+        state["plan_revision"] = int(state.get("plan_revision") or 0) + 1
+    state["plan"] = plan
+    state["plan_state"] = plan_state_for(plan)
+    state["plan_turn_id"] = event.get("turn_id") or state.get("current_turn_id")
+    state["plan_updated_at"] = now
 
 
 def handle_event(event: dict[str, Any], run_id: str) -> None:
@@ -81,6 +89,11 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
                 state["tool_stats"] = {}
                 state["agents"] = {}
                 state["plan"] = []
+                state["plan_state"] = "empty"
+                state["plan_turn_id"] = None
+                state["plan_updated_at"] = None
+                state["plan_revision"] = 0
+                state["current_turn_id"] = None
                 state["compactions"] = 0
                 state["started_at"] = now
         elif not previous_session_id:
@@ -94,6 +107,8 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
                 state[key] = value
         if event_session_id:
             state["thread_id"] = event_session_id
+        if event.get("turn_id"):
+            state["current_turn_id"] = event["turn_id"]
 
         if event_name == "SessionStart":
             if source in {"startup", "resume", "clear"} and not previous_session_id:
@@ -101,6 +116,17 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
             if source != "compact":
                 state["status"] = "ready"
         elif event_name == "UserPromptSubmit":
+            incoming_turn_id = event.get("turn_id")
+            plan_turn_id = state.get("plan_turn_id")
+            same_plan_turn = bool(
+                incoming_turn_id and plan_turn_id and incoming_turn_id == plan_turn_id
+            )
+            if (
+                state.get("plan_state") == "active"
+                and state.get("plan")
+                and not same_plan_turn
+            ):
+                state["plan_state"] = "stale"
             state["status"] = "working"
         elif event_name == "PreToolUse":
             tool_name = str(event.get("tool_name") or "tool")
@@ -111,11 +137,7 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
             }
             state["status"] = "working"
             if tool_name == "update_plan":
-                tool_input = event.get("tool_input")
-                if isinstance(tool_input, dict):
-                    plan = _normalize_plan(tool_input.get("plan"))
-                    if plan:
-                        state["plan"] = plan
+                _record_plan(state, event.get("tool_input"), event, now)
         elif event_name == "PostToolUse":
             tool_name = str(event.get("tool_name") or "tool")
             active = state.setdefault("active_tools", {}).pop(_tool_key(event), None)
@@ -128,11 +150,7 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
                     0, int((now - float(active["started_at"])) * 1000)
                 )
             if tool_name == "update_plan":
-                tool_input = event.get("tool_input")
-                if isinstance(tool_input, dict):
-                    plan = _normalize_plan(tool_input.get("plan"))
-                    if plan:
-                        state["plan"] = plan
+                _record_plan(state, event.get("tool_input"), event, now)
         elif event_name == "SubagentStart":
             agent_id = str(event.get("agent_id") or "agent")
             state.setdefault("agents", {})[agent_id] = {
@@ -157,9 +175,15 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
         elif event_name == "Stop":
             state["status"] = "ready"
             state["active_tools"] = {}
+            state["plan_state"] = plan_state_for(
+                state.get("plan"), stale=bool(state.get("plan"))
+            )
         elif event_name == "SessionEnd":
             state["status"] = "ended"
             state["active_tools"] = {}
+            state["plan_state"] = plan_state_for(
+                state.get("plan"), stale=bool(state.get("plan"))
+            )
 
     update_state(run_id, mutate)
 

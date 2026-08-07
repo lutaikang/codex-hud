@@ -16,9 +16,73 @@ except ImportError:  # pragma: no cover - Windows fallback for future ports
     fcntl = None
 
 
-STATE_VERSION = 2
-HUD_LINES = 8
+STATE_VERSION = 4
+HUD_MIN_LINES = 8
+HUD_MAX_LINES = 10
+# Backward-compatible name used by the launcher and existing callers.
+HUD_LINES = HUD_MIN_LINES
 HUD_VERSION = "0.3.13"
+KNOWN_PLAN_STATUSES = {"pending", "in_progress", "completed"}
+
+
+def normalize_plan(value: Any) -> list[dict[str, str]]:
+    """Keep the Codex plan shape small without hiding malformed tasks."""
+    if not isinstance(value, list):
+        return []
+    plan: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            plan.append({"step": "未命名任务", "status": "unknown"})
+            continue
+        step = item.get("step")
+        status = item.get("status")
+        if not isinstance(step, str) or not step.strip():
+            step = "未命名任务"
+        if not isinstance(status, str):
+            status = "unknown"
+        if status == "inProgress":
+            status = "in_progress"
+        if status not in KNOWN_PLAN_STATUSES:
+            status = "unknown"
+        plan.append({"step": step[:240], "status": status})
+    return plan[:100]
+
+
+def unfinished_plan_items(plan: Any) -> list[dict[str, str]]:
+    """Return unfinished items with the active item shown before pending items."""
+    normalized = normalize_plan(plan)
+    indexed = list(enumerate(item for item in normalized if item["status"] != "completed"))
+    indexed.sort(key=lambda entry: (0 if entry[1]["status"] == "in_progress" else 1, entry[0]))
+    return [item for _, item in indexed]
+
+
+def plan_projection(plan: Any) -> dict[str, Any]:
+    """Return one canonical plan view for state, layout, and rendering."""
+    normalized = normalize_plan(plan)
+    unfinished = unfinished_plan_items(normalized)
+    return {
+        "items": normalized,
+        "completed": sum(item["status"] == "completed" for item in normalized),
+        "in_progress": sum(item["status"] == "in_progress" for item in normalized),
+        "pending": sum(item["status"] == "pending" for item in normalized),
+        "unknown": sum(item["status"] == "unknown" for item in normalized),
+        "unfinished": unfinished,
+    }
+
+
+def plan_state_for(plan: Any, *, stale: bool = False) -> str:
+    normalized = normalize_plan(plan)
+    if not normalized:
+        return "empty"
+    if all(item["status"] == "completed" for item in normalized):
+        return "completed"
+    return "stale" if stale else "active"
+
+
+def desired_hud_lines(state: dict[str, Any]) -> int:
+    """Return the surface height needed for the TODO detail rows."""
+    detail_rows = min(2, len(unfinished_plan_items(state.get("plan"))))
+    return min(HUD_MAX_LINES, HUD_MIN_LINES + detail_rows)
 
 
 def hud_home() -> Path:
@@ -69,6 +133,11 @@ def default_state(run_id: str) -> dict[str, Any]:
         "tool_stats": {},
         "agents": {},
         "plan": [],
+        "plan_state": "empty",
+        "plan_turn_id": None,
+        "plan_updated_at": None,
+        "plan_revision": 0,
+        "current_turn_id": None,
         "compactions": 0,
     }
 
@@ -79,7 +148,18 @@ def load_state(run_id: str) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default_state(run_id)
-    return value if isinstance(value, dict) else default_state(run_id)
+    if not isinstance(value, dict):
+        return default_state(run_id)
+    defaults = default_state(run_id)
+    for key, default in defaults.items():
+        value.setdefault(key, default)
+    value["plan"] = normalize_plan(value.get("plan"))
+    normalized_state = plan_state_for(value["plan"])
+    if normalized_state in {"empty", "completed"}:
+        value["plan_state"] = normalized_state
+    elif value.get("plan_state") not in {"active", "stale"}:
+        value["plan_state"] = normalized_state
+    return value
 
 
 def update_state(
