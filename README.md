@@ -12,7 +12,7 @@ codex-hud on
 codex-hud run
 ```
 
-Codex 插件负责分发 Hook、Skill 和插件元数据；真正创建 Ghostty split 或 tmux pane 的仍是 `codex-hud run` 启动 wrapper。普通 `codex` 不会自动出现 HUD，也不要在已经运行的 Codex thread 内再启动嵌套的交互式 Codex。完整边界与可行性分析见 [Codex 插件启动分析](docs/plugin-startup-analysis.md)。
+Codex 插件负责分发 Hook、Skill 和插件元数据；真正创建 Ghostty split 或 tmux pane 的仍是 `codex-hud run` 启动 wrapper。普通 `codex` 不会自动出现 HUD，也不要在已经运行的 Codex thread 内再启动嵌套的交互式 Codex。完整边界与可行性分析见 [Codex 插件启动分析](plugins/codex-hud/docs/plugin-startup-analysis.md)。
 
 传递 Codex 参数：
 
@@ -46,11 +46,12 @@ L8  TODO   8/12  ◐ 当前任务名
 ```text
 .agents/plugins/marketplace.json    本地 marketplace
 plugins/codex-hud/                  插件本体、Hook、渲染器和测试
-docs/architecture.md                数据流、终端路线与设计取舍
-docs/metrics-semantics.md           Context/cache/cost 等指标口径
-docs/plugin-startup-analysis.md     Codex 插件原生启动可行性分析
-docs/themes.md                      Hub 主题和终端显示规则
-docs/troubleshooting.md             安装、账号、版本与 tmux 排障
+├── README.md                       使用、主题、隐私和显示说明
+└── docs/
+    ├── architecture.md             数据流、终端路线与设计取舍
+    ├── metrics-semantics.md        Context/cache/cost 等指标口径
+    ├── plugin-startup-analysis.md  插件启动方式设计记录
+    └── troubleshooting.md          安装、账号、版本与 tmux 排障
 scripts/install.sh                  校验并安装
 scripts/update.sh                   重新安装更新
 scripts/uninstall.sh                卸载插件，保留本地偏好
@@ -83,7 +84,7 @@ HUD 包装路径为 Codex 注入官方 `--no-alt-screen`，让对话输出保留
 ./scripts/verify.sh
 ```
 
-发布或升级 Codex CLI 前，应重新核对 `docs/metrics-semantics.md` 中的版本敏感公式。
+发布或升级 Codex CLI 前，应重新核对 `plugins/codex-hud/docs/metrics-semantics.md` 中的版本敏感公式。
 
 本地修改插件后运行 `./scripts/update.sh`。随后请新开 Codex thread，使 Hook 和 Skill 从新版本加载。
 

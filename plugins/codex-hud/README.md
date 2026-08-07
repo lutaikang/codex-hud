@@ -15,6 +15,12 @@ TODO   8/12  ◐ 当前任务名
 
 面板严格占 8 行；渲染末尾不输出换行，因此不会滚出空白行。tmux fallback 创建 HUD pane 时使用 `split-window -l 8`；Ghostty 原生 split 启动后由 geometry monitor 动态校准到 8 行。窄终端通过 ANSI 与 CJK 字符宽度安全裁剪内容，不自动换行。
 
+## 主题与显示
+
+默认主题使用少量语义色：青色用于栏目和模型，紫色用于账号，绿色用于完成/低 Context 压力，黄色用于运行中或 65% 以上压力，红色用于 85% 以上压力。设置 `NO_COLOR=1` 可关闭颜色。
+
+HUD 不依赖 Nerd Font，只使用常见 Unicode 字符；若终端字体显示异常，可配合 `NO_COLOR=1` 使用 UTF-8 等宽字体。所有行按终端列宽裁剪，中日韩全角字符计两列。
+
 ## 为什么采用终端侧车面板
 
 Codex 官方 `tui.status_line` 只接受有序的原生标识符，适合保留单行状态；它没有插件可写的多行区域。HUD 因此采用独立的终端侧车 surface：Ghostty standalone 使用原生 split，其他环境使用 tmux pane。生命周期与 Codex 进程绑定，插件不用 patch TUI，升级失败时也可直接关闭。详细设计见 `docs/architecture.md`。
@@ -109,4 +115,4 @@ Codex 0.146 默认使用 alternate screen；tmux 开启 mouse 后，默认 `Whee
 codex-hud status
 ```
 
-常见问题、tmux 内外启动差异及账号边界见插件包内的 `docs/troubleshooting.md`。指标口径见 `docs/metrics-semantics.md`，插件启动边界见 `docs/plugin-startup-analysis.md`，主题与终端兼容策略见 `docs/themes.md`。
+常见问题、tmux 内外启动差异及账号边界见插件包内的 `docs/troubleshooting.md`。指标口径见 `docs/metrics-semantics.md`，插件启动边界见 `docs/plugin-startup-analysis.md`。主题与终端显示规则见本 README 的“主题与显示”小节。
