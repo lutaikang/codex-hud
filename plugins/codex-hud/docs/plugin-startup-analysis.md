@@ -2,14 +2,14 @@
 
 > 状态：设计记录，暂不实现
 > 首次审计：2026-08-07
-> 当前环境：Codex CLI 0.147.0，codex-hud 0.3.13+codex.20260807054520
-> 范围：分析完整 8 行 HUD 的启动入口、降级形态与演进方向，不修改实现代码
+> 当前环境：Codex CLI 0.147.0，codex-hud 0.3.14（cachebuster 在安装时生成）
+> 范围：分析完整 HUD（基础 8 行，计划展开最多 10 行）的启动入口、降级形态与演进方向
 
 ## 1. 决策摘要
 
 Codex HUD 已经能够作为 Codex 插件安装、启用并运行 Hook/Skill，但当前 Codex 插件接口没有观察到 pre-launch wrapper 或插件可写的多行 TUI surface。
 
-完整 8 行 HUD 必须在 Codex 启动前完成参数注入和终端编排，因此现阶段仍应保持：
+完整 HUD 必须在 Codex 启动前完成参数注入和终端编排，因此现阶段仍应保持：
 
 ```text
 Codex plugin
@@ -42,7 +42,7 @@ pre-launch owner
 | 证据 | 结果 | 含义 |
 |---|---|---|
 | `codex plugin list` | `codex-hud@codex-hud-local` installed, enabled | 插件安装链路成立 |
-| 插件版本 | `0.3.13+codex.20260807054520` | 当前源码已进入 Codex 插件缓存 |
+| 插件版本 | `0.3.14+codex.<timestamp>` | 当前源码与缓存刷新后使用的版本格式 |
 | Codex 配置 | `[plugins."codex-hud@codex-hud-local"] enabled = true` | 插件在当前 `CODEX_HOME` 启用 |
 | Hook trust state | SessionStart、Pre/PostToolUse、Subagent、Compact、Stop 等均有 trusted hash | 生命周期 Hook 已被 Codex 接纳 |
 | 命令入口 | `~/.local/bin/codex-hud` 指向源码 wrapper | 当前 CLI 入口由安装脚本 symlink 提供 |
@@ -82,7 +82,7 @@ Ghostty 多窗口环境不能依赖“当前 front window”猜测目标 termina
 
 启动器需要：
 
-- 创建并校准 8 行 HUD surface；
+- 创建并校准基础 8 行、按未完成计划展开至最多 10 行的 HUD surface；
 - 将 Ghostty HUD surface 设为 read-only；
 - 防止 tmux HUD pane 抢焦点或错误进入 copy-mode；
 - 处理 Codex 正常退出、detach、TERM/HUP、启动失败和超时；
@@ -124,7 +124,7 @@ Codex 插件本身当前不能直接实现。可以通过 Shell function、PATH 
 
 ## 5. 方案总览
 
-| 方案 | 完整 8 行 HUD | 透明度 | 跨终端 | 风险 | 推荐等级 |
+| 方案 | 完整 HUD | 透明度 | 跨终端 | 风险 | 推荐等级 |
 |---|---:|---:|---:|---:|---|
 | 当前 `codex-hud run` | 是 | 低 | 高 | 低 | 基线 |
 | `codex-hud` 默认直接启动 | 是 | 中 | 高 | 低 | P0 |
@@ -372,7 +372,7 @@ Hook 可能继承 `TMUX` 和 `TMUX_PANE`，因此可以在 Codex 启动后创建
 
 - 当前 status line 只接受 Codex 支持的原生标识符；
 - 插件不能写入自定义多行内容；
-- 无法完整展示当前 8 行语义。
+- 无法完整展示当前 HUD 语义。
 
 判断：适合独立的 compact 产品模式，不是完整 HUD 的替代启动方式。
 
@@ -395,7 +395,7 @@ Codex Hooks / App Server
 
 限制：
 
-- 不再是 Codex 下方固定 8 行 HUD；
+- 不再是 Codex 下方固定高度 HUD；
 - 需要 daemon 生命周期、IPC、session 发现和安全边界；
 - 多账号、多个 `CODEX_HOME` 和 transcript 访问需要重新设计；
 - 与当前 local-only 单 run 模型差异很大。
@@ -419,7 +419,7 @@ Codex Hooks / App Server
 
 限制：
 
-- 没有实时 8 行 HUD；
+- 没有实时 HUD；
 - 不适用于交互式历史滚动和 Ghostty surface。
 
 判断：可作为独立的 headless telemetry 模式。
@@ -459,7 +459,7 @@ P0 设计阶段需要先确定：
 - compact 原生 status line；
 - headless telemetry。
 
-这些能力不应与完整 8 行 HUD 的启动语义混为一谈。
+这些能力不应与完整 HUD 的启动语义混为一谈。
 
 ### P3：暂不作为主方案
 
@@ -478,7 +478,7 @@ P0 设计阶段需要先确定：
 - 不安装同名 `codex` shim；
 - 不从当前 Codex thread 内嵌套启动交互式 Codex；
 - 不把 SessionStart Hook 直接改造成终端布局 owner；
-- 不把完整 8 行 HUD 降级为单行后仍宣称功能等价；
+- 不把完整 HUD 降级为单行后仍宣称功能等价；
 - 不启动 daemon、Web UI 或 GUI 自动化实验。
 
 ## 9. 后续设计验收条件
@@ -499,7 +499,7 @@ P0 设计阶段需要先确定：
 
 - 多窗口时只分割目标 terminal；
 - 主 surface 保持原生滚轮、拖选和右键；
-- HUD 始终 read-only 且保持 8 行；
+- HUD 始终 read-only 且保持基础 8 行；存在未完成任务时最多扩展到 10 行；
 - 启动失败、信号和 Codex 退出后无孤儿 split。
 
 ### 9.3 tmux

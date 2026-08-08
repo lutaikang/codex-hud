@@ -25,6 +25,7 @@ from hud_state import (
     hud_home,
     load_state,
     mark_ended,
+    plan_projection,
     remove_run,
     set_enabled,
 )
@@ -990,13 +991,35 @@ def run_main(
         _restore_termination_handlers(termination_handlers)
 
 
+def _print_run_status(run_id: str, details: bool = False) -> None:
+    state = load_state(run_id)
+    projection = plan_projection(state.get("plan"))
+    print(f"run: {run_id}")
+    print(f"status: {state.get('status', 'unknown')}")
+    print(
+        f"plan: {state.get('plan_state', 'empty')} "
+        f"{projection['completed']}/{len(projection['items'])}"
+    )
+    if details:
+        for item in projection["items"]:
+            marker = {
+                "completed": "✓",
+                "in_progress": "◐",
+                "pending": "○",
+                "unknown": "?",
+            }.get(item["status"], "?")
+            print(f"{marker} {item['step']} [{item['status']}]")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="codex-hud")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("on", help="启用多行 HUD")
     subparsers.add_parser("off", help="关闭多行 HUD")
     subparsers.add_parser("toggle", help="切换 HUD 开关")
-    subparsers.add_parser("status", help="显示 HUD 状态")
+    status_parser = subparsers.add_parser("status", help="显示 HUD 状态")
+    status_parser.add_argument("--run-id")
+    status_parser.add_argument("--details", action="store_true")
     run_parser = subparsers.add_parser("run", help="在 HUD 布局中启动 Codex")
     run_parser.add_argument("arguments", nargs=argparse.REMAINDER)
     internal = subparsers.add_parser("_run-main", help=argparse.SUPPRESS)
@@ -1025,6 +1048,9 @@ def main() -> int:
         print(f"Codex HUD：{'已开启' if enabled() else '已关闭'}")
         print(f"tmux：{tmux_status}")
         print("账号范围：当前 CODEX_HOME 的当前账号")
+        run_id = args.run_id or os.environ.get("CODEX_HUD_RUN_ID")
+        if run_id:
+            _print_run_status(run_id, details=args.details)
         return 0
     if args.command == "run":
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments

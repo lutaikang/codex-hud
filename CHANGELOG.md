@@ -2,7 +2,18 @@
 
 ## Unreleased
 
-- Align root and packaged documentation with the current 0.3.13 implementation.
+- Keep TODO plans turn-aware: empty `update_plan` calls clear stale state, while
+  unfinished plans at Stop are labeled unsynchronized instead of being guessed
+  complete.
+- Expand the HUD from its base 8 rows to at most 10 rows to show the current and
+  next unfinished tasks, with stable overflow counts and dynamic Ghostty/tmux
+  resizing.
+- Preserve the TODO summary and first detail row while a surface is temporarily
+  between its 8-row base and expanded height.
+- Harden malformed-plan migration, same-turn state transitions, SessionEnd
+  cleanup, narrow-surface rendering, observed tmux height reconciliation, and
+  Ghostty renderer heartbeat expiry.
+- Align root and packaged documentation with the current 0.3.14 implementation.
 - Correct Context documentation to the raw-token baseline used by `metrics.py` and its regression fixtures.
 - Document the boundary between Codex plugin installation/Hook loading and the external `codex-hud run` pre-launch wrapper.
 - Remove duplicated fallback guidance and archive-only local E2E artifacts from the working tree.

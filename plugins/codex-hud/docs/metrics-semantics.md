@@ -31,7 +31,7 @@ used_pct         = 100 - remaining_pct
 - Session 从当前 wrapper 收到首次 `SessionStart` 起计时。
 - 工具次数在 `PostToolUse` 累加，进行中耗时从 `PreToolUse` 起算。
 - 子代理由 `SubagentStart` / `SubagentStop` 跟踪。
-- Todo 来自 `update_plan` 的 plan；只显示当前进行项或首个 pending 项。
+- Todo 只来自 `update_plan` 的 plan，不根据 Git 或最终回复猜测完成状态。第 8 行显示汇总，最多追加两行未完成任务；Stop 或 SessionEnd 时仍未完成的计划标记为“计划未同步”，空 plan 会明确清除旧状态。非法任务项按 unknown 保留，不会被显示为全部完成。
 
 ## 账号边界
 

@@ -1,6 +1,6 @@
 # Codex HUD
 
-Codex HUD 是一个本地 8 行实时遥测侧车面板插件，在 Codex 主面板下方显示会话状态、上下文压力、缓存、工具、子代理、Skills、Todo 和成本估算。macOS standalone Ghostty 使用 Ghostty 原生 split；已在 tmux 内或非 Ghostty 环境才使用 tmux fallback。
+Codex HUD 是一个本地实时遥测侧车面板插件，默认占 8 行；当计划存在未完成任务时，TODO 区域最多展开到 10 行。它在 Codex 主面板下方显示会话状态、上下文压力、缓存、工具、子代理、Skills、Todo 和成本估算。macOS standalone Ghostty 使用 Ghostty 原生 split；已在 tmux 内或非 Ghostty 环境才使用 tmux fallback。
 
 核心原则：不修改 Codex TUI、不读取其他账号历史、可随时开关。
 
@@ -26,9 +26,10 @@ codex-hud run -- -C /path/to/project --search
 codex-hud off
 codex-hud toggle
 codex-hud status
+codex-hud status --run-id <run-id> --details
 ```
 
-## 面板布局（8 行）
+## 面板布局（基础 8 行）
 
 ```
 L1  HUD ● working  [gpt-5.6-sol · xhigh]  acct:user  project git:(branch*)  ⏱ 1h 02m  ≈$7.22
@@ -38,8 +39,12 @@ L4  TOOLS  ◐ Read 5s · ◐ Bash 3s · ◐ Write 1s  … +2 more
 L5         ✓ Bash ×343 · ✓ Read ×23 · ✓ Write ×8  … +7 more
 L6  AGENTS ◐ reviewer 5m · ◐ explorer 2m · ✓ 5 complete
 L7  SKILLS ◐ brainstorming 30s · ✓ ×3
-L8  TODO   8/12  ◐ 当前任务名
+L8  TODO   8/12 · 4 未完成 · ◐ 执行中
+L9         ◐ 当前任务名
+L10        ○ 下一任务  … +2
 ```
+
+计划存在未完成任务时，HUD 会追加最多两行任务列表，surface 动态扩展到 9–10 行；超过两项时显示前两项和溢出数量。计划停止但未明确收尾时显示“计划未同步”，不会自动把任务标记为完成。终端不足 8 行时优先保留 TODO 汇总，任务详情会隐藏而不会滚屏。
 
 ## 项目结构
 
@@ -64,18 +69,18 @@ scripts/verify.sh                   单测和校验
 
 `codex-hud run` 根据承载终端选择布局：macOS standalone Ghostty 通过 Ghostty 原生下方 split 创建 Codex 主面板和 HUD surface；已在 tmux 内或非 Ghostty 环境才创建 tmux session/pane。Codex 生命周期 Hook 只在 wrapper 注入 `CODEX_HUD_RUN_ID` 时写本地状态；renderer 增量读取当前 transcript 的 token 事件，并用本地 `codex app-server` 读取当前账号与限额。
 
-插件安装本身已经成立：`codex plugin add` 会启用 manifest、Hook 和 Skill；但当前插件接口没有“在 Codex 父进程启动前包裹命令”或“向 TUI 注入多行区域”的入口。因此完整 8 行 HUD 采用“插件负责集成，wrapper 负责终端编排”的混合架构。
+插件安装本身已经成立：`codex plugin add` 会启用 manifest、Hook 和 Skill；但当前插件接口没有“在 Codex 父进程启动前包裹命令”或“向 TUI 注入多行区域”的入口。因此完整 HUD 采用“插件负责集成，wrapper 负责终端编排”的混合架构。
 
 Context 百分比基于 Codex 写入 transcript 的原始 `model_context_window` 和 `total_tokens` 值，与 Codex 原生 TUI 口径一致。成本始终标为 API 等价估算。
 
-HUD 包装路径为 Codex 注入官方 `--no-alt-screen`，让对话输出保留在承载终端的 scrollback；普通无 HUD 的 `codex` 不受影响。在 standalone Ghostty 中，主 Codex surface 不经过 tmux，滚轮、左键选区、释放保持和右键菜单全部由 Ghostty/Codex 原生处理；HUD surface 原生 read-only，并由 geometry monitor 动态保持 8 行。已在 tmux 内时无法绕过外层 tmux，wrapper 保留兼容的 tmux mouse lease；非 Ghostty 或非 macOS 环境使用 tmux fallback。插件不安装 server-global 自定义鼠标绑定。
+HUD 包装路径为 Codex 注入官方 `--no-alt-screen`，让对话输出保留在承载终端的 scrollback；普通无 HUD 的 `codex` 不受影响。在 standalone Ghostty 中，主 Codex surface 不经过 tmux，滚轮、左键选区、释放保持和右键菜单全部由 Ghostty/Codex 原生处理；HUD surface 原生 read-only，并由 geometry monitor 动态保持 8–10 行。已在 tmux 内时无法绕过外层 tmux，wrapper 保留兼容的 tmux mouse lease；非 Ghostty 或非 macOS 环境使用 tmux fallback，renderer 会在计划变化时调整 pane 高度。插件不安装 server-global 自定义鼠标绑定。
 
 ### 路线图
 
 - [x] v0.1.0 — 基础 5 行布局、Hook 事件采集、transcript 扫描
 - [x] v0.2.0 — Codex Context fixture、账号边界、marketplace 安装
 - [x] v0.3.0 — 8 行布局、TOOLS/SKILLS 拆分、鼠标滚轮、高度自固定
-- [x] v0.3.13 — Ghostty 原生 split、inline scrollback、read-only HUD 与动态高度校准
+- [x] v0.3.14 — 计划状态迁移、窄屏裁剪、实际高度校准与 Ghostty heartbeat
 - [ ] 未来 — 主题配置、多账号摘要、自定义行可见性、性能优化
 
 ## 开发验证

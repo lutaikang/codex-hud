@@ -539,6 +539,27 @@ class HudTest(unittest.TestCase):
         self.assertNotIn("全部完成", lines[7])
         self.assertIn("1 未完成", lines[7])
 
+    def test_load_state_migrates_legacy_plan_and_version(self) -> None:
+        path = hud_state.run_path(self.run_id)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "run_id": self.run_id,
+                    "plan": [{"step": 123, "status": "pending"}],
+                    "plan_state": "empty",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["version"], hud_state.STATE_VERSION)
+        self.assertEqual(state["plan"][0]["status"], "pending")
+        self.assertEqual(state["plan"][0]["step"], "未命名任务")
+        self.assertEqual(state["plan_state"], "active")
+
     def test_small_geometry_preserves_todo_summary(self) -> None:
         state = hud_state.default_state(self.run_id)
         state.update(
@@ -559,6 +580,16 @@ class HudTest(unittest.TestCase):
         self.assertEqual(len(visible), 7)
         self.assertIn("TODO", "\n".join(visible))
         self.assertNotIn("Keep visible", "\n".join(visible))
+
+    def test_partial_dynamic_geometry_keeps_summary_and_first_detail(self) -> None:
+        lines = [f"line-{index}" for index in range(8)] + ["detail-1", "detail-2"]
+
+        visible = hud_render.fit_lines_for_geometry(lines, 9)
+
+        self.assertEqual(visible, lines[:9])
+        self.assertEqual(visible.count("line-7"), 1)
+        self.assertIn("detail-1", visible)
+        self.assertNotIn("detail-2", visible)
 
     def test_plan_detail_preserves_overflow_suffix_when_clipped(self) -> None:
         item = {"step": "B" * 240, "status": "pending"}
@@ -638,6 +669,14 @@ class HudTest(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def test_tmux_resize_decision_uses_observed_rows(self) -> None:
+        os.environ["TMUX_PANE"] = "%hud"
+        try:
+            self.assertTrue(hud_render.tmux_surface_needs_resize(10, 8))
+            self.assertFalse(hud_render.tmux_surface_needs_resize(10, 10))
+        finally:
+            os.environ.pop("TMUX_PANE", None)
 
     def test_api_render_exposes_usage_and_marks_estimate(self) -> None:
         state = hud_state.default_state(self.run_id)
@@ -790,6 +829,25 @@ class HudTest(unittest.TestCase):
         self.assertIn("PATH=/opt/bin", command)
         self.assertIn("CODEX_HOME=/tmp/codex-home", command)
         self.assertNotIn("TERM=", command)
+
+    def test_status_can_inspect_plan_details(self) -> None:
+        hud_state.update_state(
+            self.run_id,
+            lambda state: state.update(
+                plan=[
+                    {"step": "Done", "status": "completed"},
+                    {"step": "Pending", "status": "pending"},
+                ],
+                plan_state="stale",
+            ),
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            codex_hud_cli._print_run_status(self.run_id, details=True)
+
+        rendered = output.getvalue()
+        self.assertIn("plan: stale 1/2", rendered)
+        self.assertIn("Pending [pending]", rendered)
 
     def test_hud_forces_codex_native_inline_scrollback_mode(self) -> None:
         self.assertEqual(

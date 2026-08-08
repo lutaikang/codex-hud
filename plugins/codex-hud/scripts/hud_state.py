@@ -21,7 +21,7 @@ HUD_MIN_LINES = 8
 HUD_MAX_LINES = 10
 # Backward-compatible name used by the launcher and existing callers.
 HUD_LINES = HUD_MIN_LINES
-HUD_VERSION = "0.3.13"
+HUD_VERSION = "0.3.14"
 KNOWN_PLAN_STATUSES = {"pending", "in_progress", "completed"}
 
 
@@ -153,6 +153,7 @@ def load_state(run_id: str) -> dict[str, Any]:
     defaults = default_state(run_id)
     for key, default in defaults.items():
         value.setdefault(key, default)
+    value["version"] = STATE_VERSION
     value["plan"] = normalize_plan(value.get("plan"))
     normalized_state = plan_state_for(value["plan"])
     if normalized_state in {"empty", "completed"}:

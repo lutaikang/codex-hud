@@ -29,7 +29,6 @@ from hud_state import (
     enabled,
     load_state,
     plan_projection,
-    unfinished_plan_items,
 )
 from metrics import official_context_usage
 
@@ -87,6 +86,11 @@ def resize_tmux_surface(target_lines: int) -> bool:
     return result.returncode == 0
 
 
+def tmux_surface_needs_resize(target_lines: int, observed_rows: int) -> bool:
+    """Compare the requested height with the pane's observed height."""
+    return bool(os.environ.get("TMUX_PANE")) and int(target_lines) != int(observed_rows)
+
+
 def _write_private_json(path: Path, value: dict[str, int]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(
@@ -110,7 +114,10 @@ def _touch_private(path: Path) -> None:
         os.fchmod(descriptor, 0o600)
     finally:
         os.close(descriptor)
-    os.utime(path, None)
+    try:
+        os.utime(path, None)
+    except FileNotFoundError:
+        pass
 
 
 def color(name: str, text: str) -> str:
@@ -203,6 +210,10 @@ def fit_lines_for_geometry(lines: list[str], rows: int) -> list[str]:
     if len(lines) <= target:
         return lines
     todo_index = 7 if len(lines) > 7 else len(lines) - 1
+    if target > todo_index:
+        # The summary already fits. Keep as many detail rows as the observed
+        # surface can hold instead of appending the summary a second time.
+        return lines[:target]
     if target == 1:
         return [lines[todo_index]]
     return [*lines[: target - 1], lines[todo_index]]
@@ -817,7 +828,8 @@ def main() -> int:
                 }
             if not args.once and os.environ.get("TMUX_PANE"):
                 target_lines = desired_hud_lines(state)
-                if geometry["rows"] != target_lines and resize_tmux_surface(target_lines):
+                if tmux_surface_needs_resize(target_lines, geometry["rows"]):
+                    resize_tmux_surface(target_lines)
                     try:
                         geometry = terminal_geometry(sys.stdout.fileno())
                     except (OSError, ValueError):

@@ -1,6 +1,6 @@
 # Codex HUD
 
-`codex-hud` 是一个本地、可开关、可复用的 Codex CLI 8 行实时监控面板。macOS standalone Ghostty 使用原生 split 在 Codex 下方显示 HUD；已在 tmux 内或非 Ghostty 环境才使用 tmux pane，保留 Codex 原生单行状态栏。
+`codex-hud` 是一个本地、可开关、可复用的 Codex CLI 实时监控面板。默认显示 8 行；计划存在未完成任务时，TODO 区域最多扩展到 10 行。macOS standalone Ghostty 使用原生 split 在 Codex 下方显示 HUD；已在 tmux 内或非 Ghostty 环境才使用 tmux pane，保留 Codex 原生单行状态栏。
 
 ```
 HUD ● working  [gpt-5.6-sol · xhigh]  acct:me/plus  git:(feat/hud*)  ⏱ 1h 02m  ≈$7.22
@@ -10,10 +10,12 @@ TOOLS  ◐ Read 5s · ◐ Bash 3s · ◐ Write 1s  … +2 more
        ✓ Bash ×343 · ✓ Read ×23 · ✓ Write ×8  … +7 more
 AGENTS ◐ reviewer 5m · ◐ explorer 2m · ✓ 5 complete
 SKILLS ◐ brainstorming 30s · ✓ ×3
-TODO   8/12  ◐ 当前任务名
+TODO   8/12 · 4 未完成 · ◐ 执行中
+       ◐ 当前任务名
+       ○ 下一任务  … +2
 ```
 
-面板严格占 8 行；渲染末尾不输出换行，因此不会滚出空白行。tmux fallback 创建 HUD pane 时使用 `split-window -l 8`；Ghostty 原生 split 启动后由 geometry monitor 动态校准到 8 行。窄终端通过 ANSI 与 CJK 字符宽度安全裁剪内容，不自动换行。
+面板基础占 8 行；有未完成计划时追加最多两行任务列表，渲染末尾不输出换行，因此不会滚出空白行。tmux fallback 先使用 `split-window -l 8`，随后由 renderer 按实际 pane 高度动态调整到最多 10 行；Ghostty 原生 split 启动后由 geometry monitor 动态校准到 8–10 行。窄终端通过 ANSI 与 CJK 字符宽度安全裁剪内容，并优先保留 TODO 汇总，不自动换行。
 
 ## 主题与显示
 
@@ -81,6 +83,7 @@ codex-hud on       # 启用多行 HUD
 codex-hud off      # 关闭；现有 HUD 面板自动退出
 codex-hud toggle   # 切换开关
 codex-hud status   # 显示状态和依赖
+codex-hud status --run-id <run-id> --details  # 查看计划状态和完整任务
 codex-hud run      # 在 HUD 布局中启动 Codex
 ```
 
@@ -98,7 +101,7 @@ codex-hud run -- -C /path/to/repo --search
 
 Codex 0.146 默认使用 alternate screen；tmux 开启 mouse 后，默认 `WheelUpPane` 会把滚轮作为原始鼠标事件发给 Codex，但 Codex TUI 明确忽略 mouse event，因此不能形成历史滚动。`codex-hud run` 只在 HUD 包装路径注入 Codex 官方 `--no-alt-screen`，让主对话按官方 inline 模式写入承载终端的 scrollback；未启用 HUD 的普通 `codex` 不受影响。
 
-**Ghostty/macOS standalone**：wrapper 不创建 tmux 主 session，而是通过 Ghostty 原生 split 创建 HUD surface；Codex 使用官方 `--no-alt-screen`，历史输出留在 Ghostty terminal scrollback，滚轮、拖选、释放保持和右键菜单由 Ghostty 原生处理。HUD surface 原生 read-only，且由 geometry monitor 动态保持 8 行。目标 terminal 通过唯一 OSC 7 working-directory marker 定位，避免多窗口时误选 front window。
+**Ghostty/macOS standalone**：wrapper 不创建 tmux 主 session，而是通过 Ghostty 原生 split 创建 HUD surface；Codex 使用官方 `--no-alt-screen`，历史输出留在 Ghostty terminal scrollback，滚轮、拖选、释放保持和右键菜单由 Ghostty 原生处理。HUD surface 原生 read-only，且由 geometry monitor 动态保持 8–10 行。目标 terminal 通过唯一 OSC 7 working-directory marker 定位，避免多窗口时误选 front window。
 
 **已在 tmux 内或非 Ghostty/非 macOS**：使用 tmux fallback。该路径只能在 tmux 能力范围内提供滚动和 pane 生命周期，不能宣称等同 Ghostty standalone 的原生选区和 context menu；退出时会恢复原有 session mouse 设置。
 
@@ -115,4 +118,4 @@ Codex 0.146 默认使用 alternate screen；tmux 开启 mouse 后，默认 `Whee
 codex-hud status
 ```
 
-常见问题、tmux 内外启动差异及账号边界见插件包内的 `docs/troubleshooting.md`。指标口径见 `docs/metrics-semantics.md`，插件启动边界见 `docs/plugin-startup-analysis.md`。主题与终端显示规则见本 README 的“主题与显示”小节。
+常见问题、tmux 内外启动差异及账号边界见插件包内的 `docs/troubleshooting.md`。指标口径见 `docs/metrics-semantics.md`，插件启动边界见 `docs/plugin-startup-analysis.md`。主题、终端显示和动态 TODO 规则见本 README 的“主题与显示”小节及上方布局说明。
