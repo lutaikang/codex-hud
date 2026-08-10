@@ -28,7 +28,10 @@ from hud_state import (
     desired_hud_lines,
     enabled,
     load_state,
+    plan_detail_items,
     plan_projection,
+    recent_completed_items,
+    sanitize_display_text,
 )
 from metrics import official_context_usage
 
@@ -193,14 +196,25 @@ def _visible_width(text: str) -> int:
 def plan_detail_line(
     item: dict[str, Any], index: int, total: int, width: int
 ) -> str:
+    overflow = max(0, total - 2) if index == 1 else 0
+    return task_detail_line(item, index, total, width, overflow=overflow)
+
+
+def task_detail_line(
+    item: dict[str, Any],
+    index: int,
+    total: int,
+    width: int,
+    *,
+    overflow: int = 0,
+) -> str:
     status = item.get("status")
-    marker = "◐" if status == "in_progress" else "?" if status == "unknown" else "○"
-    prefix = f"       {color('yellow', marker)} "
-    visible_count = min(2, total)
-    overflow = total - visible_count if index == visible_count - 1 else 0
+    marker = "◐" if status == "in_progress" else "?" if status == "unknown" else "✓" if status == "completed" else "○"
+    marker_color = "green" if status == "completed" else "yellow"
+    prefix = f"       {color(marker_color, marker)} "
     suffix = f"  … +{overflow}" if overflow > 0 else ""
     available = max(1, width - _visible_width(prefix) - _visible_width(suffix))
-    step = str(item.get("step") or "未命名任务")
+    step = sanitize_display_text(item.get("step"), 240) or "未命名任务"
     return prefix + visible_clip(step, available) + suffix
 
 
@@ -245,6 +259,8 @@ class TranscriptScanner:
         self.model: str | None = None
         self.effort: str | None = None
         self.rate_limits: dict[str, Any] = {}
+        self.agent_metadata: dict[str, dict[str, Any]] = {}
+        self._pending_agent_spawns: dict[str, dict[str, Any]] = {}
 
     def _reset_content(self) -> None:
         self.offset = 0
@@ -254,6 +270,8 @@ class TranscriptScanner:
         self.model = None
         self.effort = None
         self.rate_limits = {}
+        self.agent_metadata = {}
+        self._pending_agent_spawns = {}
 
     def scan(self, raw_path: str | None) -> None:
         if not raw_path:
@@ -297,6 +315,7 @@ class TranscriptScanner:
         effort = payload.get("effort")
         if isinstance(effort, str):
             self.effort = effort
+        self._consume_agent_metadata(record, payload)
         if record.get("type") != "event_msg" or payload.get("type") != "token_count":
             return
         info = payload.get("info")
@@ -313,6 +332,73 @@ class TranscriptScanner:
         rate_limits = payload.get("rate_limits")
         if isinstance(rate_limits, dict):
             self.rate_limits = rate_limits
+
+    def _consume_agent_metadata(
+        self, record: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        """Extract only bounded, non-prompt agent metadata from the transcript."""
+        timestamp = record.get("timestamp")
+        event_type = payload.get("type")
+        if event_type == "function_call" and payload.get("name") == "spawn_agent":
+            arguments = payload.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                return
+            task_name = sanitize_display_text(arguments.get("task_name"), 80)
+            if not task_name:
+                return
+            model = sanitize_display_text(arguments.get("model"), 80)
+            self._pending_agent_spawns[str(payload.get("call_id") or "")] = {
+                "task_name": task_name,
+                "description": sanitize_display_text(
+                    task_name.replace("_", " ").replace("-", " "), 120
+                ),
+                "model": model or None,
+                "updated_at": timestamp,
+                "current_activity": "starting",
+            }
+            return
+
+        if event_type == "function_call_output":
+            call_id = str(payload.get("call_id") or "")
+            pending = self._pending_agent_spawns.pop(call_id, None)
+            output = payload.get("output")
+            if pending is None or not isinstance(output, str):
+                return
+            try:
+                parsed = json.loads(output)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(parsed, dict):
+                return
+            task_path = sanitize_display_text(parsed.get("task_name"), 120)
+            if not task_path.startswith("/"):
+                return
+            pending["current_activity"] = "spawned"
+            pending["updated_at"] = timestamp
+            self.agent_metadata[task_path] = pending
+            return
+
+        if event_type == "sub_agent_activity":
+            task_path = sanitize_display_text(payload.get("agent_path"), 120)
+            if not task_path:
+                return
+            metadata = self.agent_metadata.setdefault(
+                task_path,
+                {
+                    "task_name": task_path.rsplit("/", 1)[-1],
+                    "description": sanitize_display_text(
+                        task_path.rsplit("/", 1)[-1].replace("_", " "), 120
+                    ),
+                    "model": None,
+                },
+            )
+            metadata["current_activity"] = sanitize_display_text(payload.get("kind"), 40) or "active"
+            metadata["updated_at"] = payload.get("occurred_at_ms") or timestamp
 
 
 class AccountReader:
@@ -703,24 +789,67 @@ def render_lines(
     )
 
     agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    transcript_agents = scanner.agent_metadata
     running_agent_entries: list[tuple[float, str]] = []
+    recent_completed_agent_entries: list[tuple[float, str]] = []
     completed_agents = 0
-    for agent in agents.values():
+    for agent_id, raw_agent in agents.items():
+        agent = dict(raw_agent) if isinstance(raw_agent, dict) else {}
+        metadata = transcript_agents.get(str(agent_id))
+        if metadata is None:
+            task_name = str(agent.get("task_name") or "")
+            for candidate in transcript_agents.values():
+                if task_name and candidate.get("task_name") == task_name:
+                    metadata = candidate
+                    break
+        if metadata:
+            for key in ("description", "model", "current_activity", "updated_at"):
+                if metadata.get(key) is not None:
+                    agent[key] = metadata[key]
         if not isinstance(agent, dict):
             continue
         if agent.get("status") == "running":
             started = float(agent.get("started_at") or now)
+            agent_type = sanitize_display_text(agent.get("type"), 40) or "agent"
+            model = sanitize_display_text(agent.get("model"), 80)
+            description = sanitize_display_text(agent.get("description"), 80)
+            activity = sanitize_display_text(agent.get("current_activity"), 40)
+            label_parts = [f"◐ {agent_type}"]
+            if model:
+                label_parts.append(f"[{model}]")
+            if description:
+                label_parts.append(description)
+            if activity and activity not in {"working", "starting", "spawned"}:
+                label_parts.append(f"· {activity}")
             label = (
-                f"◐ {agent.get('type', 'agent')} "
-                f"{human_duration(now - started)}"
+                " ".join(label_parts) + f" {human_duration(now - started)}"
             )
             running_agent_entries.append((started, label))
         else:
             completed_agents += 1
+            ended = float(agent.get("ended_at") or agent.get("updated_at") or now)
+            agent_type = sanitize_display_text(agent.get("type"), 40) or "agent"
+            model = sanitize_display_text(agent.get("model"), 80)
+            description = sanitize_display_text(agent.get("description"), 60)
+            completed_label = f"✓ {agent_type}"
+            if model:
+                completed_label += f" [{model}]"
+            if description:
+                completed_label += f" {description}"
+            recent_completed_agent_entries.append((ended, completed_label))
     running_agent_entries.sort(key=lambda entry: entry[0], reverse=True)
-    active_agents = [label for _, label in running_agent_entries]
-    agent_summary = " · ".join(active_agents[:3]) if active_agents else "0 running"
-    agent_overflow = len(active_agents) - 3
+    recent_completed_agent_entries.sort(key=lambda entry: entry[0], reverse=True)
+    running_shown = min(2, len(running_agent_entries))
+    completed_shown = min(3 - running_shown, len(recent_completed_agent_entries))
+    agent_entries = [label for _, label in running_agent_entries[:running_shown]]
+    if len(agent_entries) < 3:
+        agent_entries.extend(
+            label for _, label in recent_completed_agent_entries[:completed_shown]
+        )
+    agent_summary = " · ".join(agent_entries) if agent_entries else "0 running"
+    agent_overflow = (len(running_agent_entries) - running_shown) + (
+        len(recent_completed_agent_entries) - completed_shown
+    )
     if agent_overflow > 0:
         agent_summary += f"  … +{agent_overflow} more"
     sixth = (
@@ -764,6 +893,7 @@ def render_lines(
     plan = projection["items"]
     completed = projection["completed"]
     unfinished = projection["unfinished"]
+    recent_completed = recent_completed_items(state, limit=2)
     plan_state = str(state.get("plan_state") or "active")
     eighth = f"{color('cyan', 'TODO')} {completed}/{len(plan)}"
     if unfinished:
@@ -774,15 +904,34 @@ def render_lines(
             eighth += f" · {color('yellow', '◐ 执行中')}"
         else:
             eighth += f" · {color('yellow', '○ 待执行')}"
+        if recent_completed:
+            eighth += f" · {color('green', f'✓ 最近完成 {len(recent_completed)}')}"
     elif plan:
         eighth += f"  {color('green', '✓ 全部完成')}"
+        if recent_completed:
+            eighth += f" · 最近完成 {len(recent_completed)}"
+    elif recent_completed:
+        eighth += f" · {color('green', f'✓ 最近完成 {len(recent_completed)}')}"
     else:
         eighth += "  · --"
 
     detail_lines: list[str] = []
-    for index, item in enumerate(unfinished[:2]):
+    detail_items = plan_detail_items(state, limit=HUD_MAX_LINES - HUD_MIN_LINES)
+    unfinished_shown = min(2, len(unfinished))
+    for index, item in enumerate(detail_items):
+        overflow = (
+            max(0, len(unfinished) - unfinished_shown)
+            if unfinished_shown and index == unfinished_shown - 1
+            else 0
+        )
         detail_lines.append(
-            plan_detail_line(item, index, len(unfinished), width or 10_000)
+            task_detail_line(
+                item,
+                index,
+                len(detail_items),
+                width or 10_000,
+                overflow=overflow,
+            )
         )
 
     return [first, second, third, fourth, fifth, sixth, seventh, eighth, *detail_lines]

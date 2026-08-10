@@ -27,6 +27,7 @@ from hud_state import (
     mark_ended,
     plan_projection,
     remove_run,
+    sanitize_display_text,
     set_enabled,
 )
 from tmux_mouse import (
@@ -1001,6 +1002,11 @@ def _print_run_status(run_id: str, details: bool = False) -> None:
         f"{projection['completed']}/{len(projection['items'])}"
     )
     if details:
+        print(f"plan revision: {state.get('plan_revision', 0)}")
+        revisions = state.get("plan_revisions")
+        if isinstance(revisions, list):
+            print(f"plan revisions retained: {len(revisions)}")
+        print("current plan:")
         for item in projection["items"]:
             marker = {
                 "completed": "✓",
@@ -1008,7 +1014,38 @@ def _print_run_status(run_id: str, details: bool = False) -> None:
                 "pending": "○",
                 "unknown": "?",
             }.get(item["status"], "?")
-            print(f"{marker} {item['step']} [{item['status']}]")
+            print(
+                f"{marker} {sanitize_display_text(item.get('step')) or '未命名任务'} "
+                f"[{item['status']}]"
+            )
+        history = state.get("plan_history")
+        if isinstance(history, list) and history:
+            print("history:")
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                status = str(item.get("status") or "unknown")
+                marker = {"completed": "✓", "in_progress": "◐", "pending": "○"}.get(status, "?")
+                print(
+                    f"{marker} {sanitize_display_text(item.get('step')) or '未命名任务'} "
+                    f"[{status}; completed at {item.get('completed_at') or '--'}]"
+                )
+        agents = state.get("agents")
+        if isinstance(agents, dict) and agents:
+            print("agents:")
+            for agent_id, agent in agents.items():
+                if not isinstance(agent, dict):
+                    continue
+                description = sanitize_display_text(agent.get("description")) or "--"
+                activity = sanitize_display_text(agent.get("current_activity")) or "--"
+                model = sanitize_display_text(agent.get("model")) or "--"
+                source = sanitize_display_text(agent.get("source_confidence"), 40) or "hook"
+                print(
+                    f"- {sanitize_display_text(agent_id, 120)} "
+                    f"{sanitize_display_text(agent.get('type'), 80) or 'agent'} "
+                    f"[{model}] {description} · {activity} "
+                    f"[{agent.get('status', 'unknown')}] source={source}"
+                )
 
 
 def main() -> int:

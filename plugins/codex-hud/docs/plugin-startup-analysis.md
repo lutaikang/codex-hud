@@ -2,8 +2,8 @@
 
 > 状态：设计记录，暂不实现
 > 首次审计：2026-08-07
-> 当前环境：Codex CLI 0.147.0，codex-hud 0.3.14（cachebuster 在安装时生成）
-> 范围：分析完整 HUD（基础 8 行，计划展开最多 10 行）的启动入口、降级形态与演进方向
+> 当前环境：Codex CLI 0.147.0，codex-hud 0.3.15（cachebuster 在安装时生成）
+> 范围：分析完整 HUD（基础 8 行，计划/历史展开最多 11 行）的启动入口、降级形态与演进方向
 
 ## 1. 决策摘要
 
@@ -42,7 +42,7 @@ pre-launch owner
 | 证据 | 结果 | 含义 |
 |---|---|---|
 | `codex plugin list` | `codex-hud@codex-hud-local` installed, enabled | 插件安装链路成立 |
-| 插件版本 | `0.3.14+codex.<timestamp>` | 当前源码与缓存刷新后使用的版本格式 |
+| 插件版本 | `0.3.15+codex.<timestamp>` | 当前源码与缓存刷新后使用的版本格式 |
 | Codex 配置 | `[plugins."codex-hud@codex-hud-local"] enabled = true` | 插件在当前 `CODEX_HOME` 启用 |
 | Hook trust state | SessionStart、Pre/PostToolUse、Subagent、Compact、Stop 等均有 trusted hash | 生命周期 Hook 已被 Codex 接纳 |
 | 命令入口 | `~/.local/bin/codex-hud` 指向源码 wrapper | 当前 CLI 入口由安装脚本 symlink 提供 |
@@ -82,7 +82,7 @@ Ghostty 多窗口环境不能依赖“当前 front window”猜测目标 termina
 
 启动器需要：
 
-- 创建并校准基础 8 行、按未完成计划展开至最多 10 行的 HUD surface；
+- 创建并校准基础 8 行、按未完成计划和最近完成项展开至最多 11 行的 HUD surface；
 - 将 Ghostty HUD surface 设为 read-only；
 - 防止 tmux HUD pane 抢焦点或错误进入 copy-mode；
 - 处理 Codex 正常退出、detach、TERM/HUP、启动失败和超时；
@@ -499,7 +499,7 @@ P0 设计阶段需要先确定：
 
 - 多窗口时只分割目标 terminal；
 - 主 surface 保持原生滚轮、拖选和右键；
-- HUD 始终 read-only 且保持基础 8 行；存在未完成任务时最多扩展到 10 行；
+- HUD 始终 read-only 且保持基础 8 行；存在未完成任务或最近完成项时最多扩展到 11 行；
 - 启动失败、信号和 Codex 退出后无孤儿 split。
 
 ### 9.3 tmux

@@ -1,6 +1,6 @@
 # Codex HUD
 
-`codex-hud` 是一个本地、可开关、可复用的 Codex CLI 实时监控面板。默认显示 8 行；计划存在未完成任务时，TODO 区域最多扩展到 10 行。macOS standalone Ghostty 使用原生 split 在 Codex 下方显示 HUD；已在 tmux 内或非 Ghostty 环境才使用 tmux pane，保留 Codex 原生单行状态栏。
+`codex-hud` 是一个本地、可开关、可复用的 Codex CLI 实时监控面板。默认显示 8 行；计划存在未完成任务或最近完成项时，TODO 区域最多扩展到 11 行。macOS standalone Ghostty 使用原生 split 在 Codex 下方显示 HUD；已在 tmux 内或非 Ghostty 环境才使用 tmux pane，保留 Codex 原生单行状态栏。
 
 ```
 HUD ● working  [gpt-5.6-sol · xhigh]  acct:me/plus  git:(feat/hud*)  ⏱ 1h 02m  ≈$7.22
@@ -8,14 +8,15 @@ CTX  ███░░░░░░░  27% used · 73% left · 68.6k/258.4k  │  
 CACHE  97% · 16.12m/16.67m
 TOOLS  ◐ Read 5s · ◐ Bash 3s · ◐ Write 1s  … +2 more
        ✓ Bash ×343 · ✓ Read ×23 · ✓ Write ×8  … +7 more
-AGENTS ◐ reviewer 5m · ◐ explorer 2m · ✓ 5 complete
+AGENTS ◐ reviewer [sol] 检查测试 · running tests 5m · ✓ 5 complete
 SKILLS ◐ brainstorming 30s · ✓ ×3
-TODO   8/12 · 4 未完成 · ◐ 执行中
+TODO   8/12 · 4 未完成 · ◐ 执行中 · ✓ 最近完成 2
        ◐ 当前任务名
        ○ 下一任务  … +2
+       ✓ 最近完成任务
 ```
 
-面板基础占 8 行；有未完成计划时追加最多两行任务列表，渲染末尾不输出换行，因此不会滚出空白行。tmux fallback 先使用 `split-window -l 8`，随后由 renderer 按实际 pane 高度动态调整到最多 10 行；Ghostty 原生 split 启动后由 geometry monitor 动态校准到 8–10 行。窄终端通过 ANSI 与 CJK 字符宽度安全裁剪内容，并优先保留 TODO 汇总，不自动换行。
+面板基础占 8 行；有未完成计划时最多显示两行未完成任务，并用空余行显示最近完成项；没有活动计划但本会话有历史完成项时仍会显示最近完成项。渲染末尾不输出换行，因此不会滚出空白行。tmux fallback 先使用 `split-window -l 8`，随后由 renderer 按实际 pane 高度动态调整到最多 11 行；Ghostty 原生 split 启动后由 geometry monitor 动态校准到 8–11 行。窄终端通过 ANSI、控制字符与 CJK 字符宽度安全裁剪内容，并优先保留 TODO 汇总，不自动换行。
 
 ## 主题与显示
 
@@ -41,9 +42,9 @@ Codex 插件负责安装和启用 manifest、生命周期 Hook 与 `codex-hud` S
 - 当前账号的短周期和 7 天用量窗口（可用时）
 - 工具运行状态（最近 3 个活跃工具，按启动时间降序）
 - 工具累计调用统计（前 5 个，按调用次数降序 + 溢出提示）
-- 子代理运行状态、耗时和完成数
+- 子代理运行状态、耗时、类型、模型、受控任务描述和最近动作摘要
 - Skills 活跃状态与累计统计
-- `update_plan` Todo 完成度及当前项
+- `update_plan` Todo 完成度、当前/待执行项和本会话最近完成项
 - 缓存输入占全部输入的中性比率
 - 基于内置参考单价的 API 等价成本估算（不是订阅账单）
 - 历史输出滚轮：Ghostty standalone 使用 Codex 官方 inline 模式保留 scrollback，由 Ghostty 原生滚动；tmux fallback 使用 tmux 能力范围内的历史滚动
@@ -83,7 +84,7 @@ codex-hud on       # 启用多行 HUD
 codex-hud off      # 关闭；现有 HUD 面板自动退出
 codex-hud toggle   # 切换开关
 codex-hud status   # 显示状态和依赖
-codex-hud status --run-id <run-id> --details  # 查看计划状态和完整任务
+codex-hud status --run-id <run-id> --details  # 查看当前/历史计划与 agent 详情
 codex-hud run      # 在 HUD 布局中启动 Codex
 ```
 
@@ -101,13 +102,13 @@ codex-hud run -- -C /path/to/repo --search
 
 Codex 0.146 默认使用 alternate screen；tmux 开启 mouse 后，默认 `WheelUpPane` 会把滚轮作为原始鼠标事件发给 Codex，但 Codex TUI 明确忽略 mouse event，因此不能形成历史滚动。`codex-hud run` 只在 HUD 包装路径注入 Codex 官方 `--no-alt-screen`，让主对话按官方 inline 模式写入承载终端的 scrollback；未启用 HUD 的普通 `codex` 不受影响。
 
-**Ghostty/macOS standalone**：wrapper 不创建 tmux 主 session，而是通过 Ghostty 原生 split 创建 HUD surface；Codex 使用官方 `--no-alt-screen`，历史输出留在 Ghostty terminal scrollback，滚轮、拖选、释放保持和右键菜单由 Ghostty 原生处理。HUD surface 原生 read-only，且由 geometry monitor 动态保持 8–10 行。目标 terminal 通过唯一 OSC 7 working-directory marker 定位，避免多窗口时误选 front window。
+**Ghostty/macOS standalone**：wrapper 不创建 tmux 主 session，而是通过 Ghostty 原生 split 创建 HUD surface；Codex 使用官方 `--no-alt-screen`，历史输出留在 Ghostty terminal scrollback，滚轮、拖选、释放保持和右键菜单由 Ghostty 原生处理。HUD surface 原生 read-only，且由 geometry monitor 动态保持 8–11 行。目标 terminal 通过唯一 OSC 7 working-directory marker 定位，避免多窗口时误选 front window。
 
 **已在 tmux 内或非 Ghostty/非 macOS**：使用 tmux fallback。该路径只能在 tmux 能力范围内提供滚动和 pane 生命周期，不能宣称等同 Ghostty standalone 的原生选区和 context menu；退出时会恢复原有 session mouse 设置。
 
 ## 数据与隐私边界
 
-状态仅保存在 `~/.codex-hud`，目录和文件使用私有权限。Hook 只处理 Codex 提供的当前 wrapper 会话事件；渲染器只读该会话的 transcript 路径，并通过同一进程环境下的本地 `codex app-server` 查询当前账号与限额。它不扫描其他 `CODEX_HOME`，不复制 `auth.json`，也不展示其他账号的历史上下文。
+状态仅保存在 `~/.codex-hud`，目录和文件使用私有权限。Hook 只处理 Codex 提供的当前 wrapper 会话事件；渲染器只读该会话的 transcript 路径，并通过同一进程环境下的本地 `codex app-server` 查询当前账号与限额。TODO 使用当前计划加有上限的会话历史；AGENTS 只保存任务名、模型和清洗后的动作摘要，不保存完整 prompt、推理过程或 agent 输出全文。它不扫描其他 `CODEX_HOME`，不复制 `auth.json`，也不展示其他账号的历史上下文。
 
 `≈$` 把观测到的输入、缓存输入和输出 token 套用内置参考单价，仅是 API 等价估算，不是 ChatGPT/Codex 订阅账单；可能不含长上下文附加费、cache write、工具费或未来价格变化。缓存比率只是 `cached_input_tokens / input_tokens`，不标注"健康/异常"，因为合理值取决于工作负载。
 

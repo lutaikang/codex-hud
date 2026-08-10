@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.3.15 - 2026-08-10
+
+- Preserve bounded per-session TODO history with stable internal task IDs,
+  revision snapshots, transition timestamps, and recent completed-task rows.
+- Enrich AGENTS with sanitized task names, models, current activity, source
+  confidence, and detailed CLI inspection without storing prompt bodies or
+  full agent output.
+- Expand dynamic HUD geometry to at most 11 rows when current tasks and recent
+  completions both need detail rows.
+
+## 0.3.14 - 2026-08-08
 
 - Keep TODO plans turn-aware: empty `update_plan` calls clear stale state, while
   unfinished plans at Stop are labeled unsynchronized instead of being guessed

@@ -140,6 +140,168 @@ class HudTest(unittest.TestCase):
         self.assertEqual(state["plan"], [])
         self.assertEqual(state["plan_state"], "empty")
 
+    def test_completed_plan_history_survives_replacement_and_empty_plan(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        for turn_id, plan in (
+            ("turn-1", [{"step": "Finished work", "status": "in_progress"}]),
+            ("turn-1", [{"step": "Finished work", "status": "completed"}]),
+            ("turn-2", [{"step": "Replacement", "status": "in_progress"}]),
+            ("turn-3", []),
+        ):
+            hud_hook.handle_event(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "thread-1",
+                    "turn_id": turn_id,
+                    "tool_name": "update_plan",
+                    "tool_input": {"plan": plan},
+                },
+                self.run_id,
+            )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["plan"], [])
+        self.assertEqual(state["current_plan"], [])
+        self.assertEqual(state["plan_history"][0]["step"], "Finished work")
+        self.assertEqual(state["plan_history"][0]["status"], "completed")
+        self.assertEqual(
+            hud_state.recent_completed_items(state)[0]["step"], "Finished work"
+        )
+
+    def test_duplicate_plan_items_keep_distinct_stable_ids(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        hud_state.reconcile_plan(
+            state,
+            [
+                {"step": "Duplicate", "status": "in_progress"},
+                {"step": "Duplicate", "status": "pending"},
+            ],
+            revision=1,
+            turn_id="turn-1",
+            updated_at=10,
+        )
+        original_ids = [item["id"] for item in state["current_plan"]]
+
+        hud_state.reconcile_plan(
+            state,
+            [
+                {"step": "Duplicate", "status": "completed"},
+                {"step": "Duplicate", "status": "in_progress"},
+            ],
+            revision=2,
+            turn_id="turn-2",
+            updated_at=20,
+        )
+
+        self.assertEqual(
+            [item["id"] for item in state["current_plan"]], original_ids
+        )
+        self.assertNotEqual(original_ids[0], original_ids[1])
+        self.assertEqual(state["current_plan"][0]["completed_at"], 20)
+
+    def test_reopened_task_is_not_reported_as_recently_completed(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        hud_state.reconcile_plan(
+            state,
+            [{"step": "Reopen me", "status": "completed"}],
+            revision=1,
+            turn_id="turn-1",
+            updated_at=10,
+        )
+        hud_state.reconcile_plan(
+            state,
+            [{"step": "Reopen me", "status": "in_progress"}],
+            revision=2,
+            turn_id="turn-2",
+            updated_at=20,
+        )
+
+        self.assertEqual(hud_state.recent_completed_items(state), [])
+        self.assertEqual(
+            [event["to"] for event in state["current_plan"][0]["transitions"]],
+            ["completed", "in_progress"],
+        )
+
+        hud_state.reconcile_plan(
+            state,
+            [],
+            revision=3,
+            turn_id="turn-3",
+            updated_at=30,
+        )
+        self.assertEqual(hud_state.recent_completed_items(state), [])
+        self.assertEqual(state["plan_history"][0]["status"], "in_progress")
+
+    def test_plan_history_is_bounded_and_duplicate_hook_frames_are_idempotent(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        for index in range(hud_state.PLAN_HISTORY_LIMIT + 5):
+            event = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "turn_id": f"turn-{index}",
+                "tool_name": "update_plan",
+                "tool_use_id": f"tool-{index}",
+                "tool_input": {
+                    "plan": [{"step": f"Done {index}", "status": "completed"}]
+                },
+            }
+            hud_hook.handle_event(event, self.run_id)
+            hud_hook.handle_event(event, self.run_id)
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(len(state["plan_history"]), hud_state.PLAN_HISTORY_LIMIT)
+        self.assertEqual(state["plan_revision"], hud_state.PLAN_HISTORY_LIMIT + 5)
+        self.assertEqual(len(state["plan_revisions"]), hud_state.PLAN_REVISION_LIMIT)
+        self.assertEqual(state["plan_history"][0]["step"], "Done 24")
+
+    def test_clear_to_new_thread_resets_plan_history(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "tool_name": "update_plan",
+                "tool_input": {
+                    "plan": [{"step": "Old completion", "status": "completed"}]
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-2",
+                "source": "clear",
+            },
+            self.run_id,
+        )
+
+        state = hud_state.load_state(self.run_id)
+        self.assertEqual(state["current_plan"], [])
+        self.assertEqual(state["plan_history"], [])
+        self.assertEqual(state["plan_revisions"], [])
+
     def test_stop_marks_incomplete_plan_stale_without_completing(self) -> None:
         hud_hook.handle_event(
             {
@@ -288,6 +450,122 @@ class HudTest(unittest.TestCase):
         self.assertEqual(state["plan_state"], "active")
         self.assertEqual(state["plan_turn_id"], "turn-2")
 
+    def test_spawn_hook_enriches_subagent_without_storing_prompt_body(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-1",
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-1",
+                "tool_input": {
+                    "task_name": "todo_history_review",
+                    "message": "secret prompt body that must not be persisted",
+                    "model": "gpt-5.6-sol\x1b]8;;bad\x07",
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "thread-1",
+                "agent_id": "agent-1",
+                "agent_type": "reviewer",
+            },
+            self.run_id,
+        )
+
+        state = hud_state.load_state(self.run_id)
+        agent = state["agents"]["agent-1"]
+        self.assertEqual(agent["task_name"], "todo_history_review")
+        self.assertEqual(agent["description"], "todo history review")
+        self.assertEqual(agent["model"], "gpt-5.6-sol")
+        self.assertEqual(agent["current_activity"], "working")
+        self.assertEqual(agent["source_confidence"], "hook+spawn")
+        self.assertNotIn("secret prompt", json.dumps(state))
+
+    def test_late_duplicate_subagent_start_does_not_reopen_completed_agent(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        start = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "thread-1",
+            "agent_id": "agent-1",
+            "agent_type": "reviewer",
+        }
+        hud_hook.handle_event(start, self.run_id)
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SubagentStop",
+                "session_id": "thread-1",
+                "agent_id": "agent-1",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(start, self.run_id)
+
+        agent = hud_state.load_state(self.run_id)["agents"]["agent-1"]
+        self.assertEqual(agent["status"], "completed")
+        self.assertIsNotNone(agent["ended_at"])
+
+    def test_failed_spawn_is_not_claimed_by_next_subagent(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-1",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_use_id": "spawn-failed",
+                "tool_input": {"task_name": "failed_task", "model": "gpt-5.6-sol"},
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "thread-1",
+                "tool_name": "collaboration.spawn_agent",
+                "tool_use_id": "spawn-failed",
+                "tool_output": "collab spawn failed: thread limit reached",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "thread-1",
+                "agent_id": "agent-1",
+                "agent_type": "reviewer",
+            },
+            self.run_id,
+        )
+
+        agent = hud_state.load_state(self.run_id)["agents"]["agent-1"]
+        self.assertIsNone(agent["task_name"])
+        self.assertIsNone(agent["model"])
+        self.assertEqual(agent["source_confidence"], "hook")
+
     def test_session_start_resets_stale_launcher_timestamp(self) -> None:
         hud_state.update_state(
             self.run_id,
@@ -356,6 +634,63 @@ class HudTest(unittest.TestCase):
         transcript.write_text("", encoding="utf-8")
         scanner.scan(str(transcript))
         self.assertEqual(scanner.total, {})
+
+    def test_transcript_extracts_agent_spawn_and_activity_metadata(self) -> None:
+        transcript = Path(self.temporary.name) / "agents.jsonl"
+        records = [
+            {
+                "timestamp": "2026-08-08T10:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "call-1",
+                    "arguments": json.dumps(
+                        {
+                            "task_name": "history_audit",
+                            "model": "gpt-5.6-sol",
+                            "message": "encrypted-or-sensitive",
+                        }
+                    ),
+                },
+            },
+            {
+                "timestamp": "2026-08-08T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": json.dumps({"task_name": "/root/history_audit"}),
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "agent_path": "/root/history_audit",
+                    "kind": "interacted",
+                    "occurred_at_ms": 1_786_129_202_000,
+                },
+            },
+        ]
+        transcript.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+
+        scanner = hud_render.TranscriptScanner()
+        scanner.scan(str(transcript))
+
+        metadata = scanner.agent_metadata["/root/history_audit"]
+        self.assertEqual(metadata["task_name"], "history_audit")
+        self.assertEqual(metadata["description"], "history audit")
+        self.assertEqual(metadata["model"], "gpt-5.6-sol")
+        self.assertEqual(metadata["current_activity"], "interacted")
+        self.assertNotIn("encrypted-or-sensitive", json.dumps(metadata))
+
+        transcript.write_text("", encoding="utf-8")
+        scanner.scan(str(transcript))
+        self.assertEqual(scanner.agent_metadata, {})
 
     def test_specific_model_price_wins_over_generic_prefix(self) -> None:
         self.assertAlmostEqual(
@@ -519,6 +854,116 @@ class HudTest(unittest.TestCase):
         self.assertIn("Next task", output)
         self.assertIn("+1", output)
 
+    def test_render_shows_current_tasks_and_recent_completion(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        hud_state.reconcile_plan(
+            state,
+            [{"step": "Recently done", "status": "completed"}],
+            revision=1,
+            turn_id="turn-1",
+            updated_at=10,
+        )
+        hud_state.reconcile_plan(
+            state,
+            [
+                {"step": "Current task", "status": "in_progress"},
+                {"step": "Next task", "status": "pending"},
+            ],
+            revision=2,
+            turn_id="turn-2",
+            updated_at=20,
+        )
+
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        self.assertEqual(len(lines), 11)
+        output = "\n".join(lines)
+        self.assertIn("Current task", output)
+        self.assertIn("Next task", output)
+        self.assertIn("Recently done", output)
+        self.assertIn("最近完成", lines[7])
+
+    def test_render_agents_shows_description_model_and_current_activity(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state["agents"] = {
+            "agent-1": {
+                "type": "reviewer",
+                "status": "running",
+                "started_at": time.time() - 5,
+                "ended_at": None,
+                "description": "TODO history audit\x1b]8;;bad\x07",
+                "model": "gpt-5.6-sol",
+                "current_activity": "running tests",
+                "source_confidence": "hook+spawn",
+            }
+        }
+
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        self.assertIn("reviewer [gpt-5.6-sol]", lines[5])
+        self.assertIn("TODO history audit", lines[5])
+        self.assertIn("running tests", lines[5])
+        self.assertNotIn("\x1b]", lines[5])
+
+    def test_render_agents_keeps_recent_completed_agent_summary(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state["agents"] = {
+            "agent-1": {
+                "type": "reviewer",
+                "status": "completed",
+                "started_at": 1,
+                "ended_at": 2,
+                "description": "history review",
+                "model": "gpt-5.6-sol",
+                "current_activity": "completed",
+                "source_confidence": "hook+spawn",
+            }
+        }
+
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        self.assertIn("reviewer [gpt-5.6-sol] history review", lines[5])
+
+    def test_completed_plan_renders_recent_completed_details(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        hud_state.reconcile_plan(
+            state,
+            [
+                {"step": "First", "status": "completed"},
+                {"step": "Second", "status": "completed"},
+            ],
+            revision=1,
+            turn_id="turn-1",
+            updated_at=10,
+        )
+
+        lines = hud_render.render_lines(
+            state,
+            hud_render.TranscriptScanner(),
+            {},
+            {},
+        )
+
+        self.assertEqual(len(lines), 10)
+        self.assertIn("全部完成", lines[7])
+        self.assertIn("First", "\n".join(lines[8:]))
+        self.assertIn("Second", "\n".join(lines[8:]))
+
     def test_invalid_plan_item_never_reports_all_completed(self) -> None:
         state = hud_state.default_state(self.run_id)
         state.update(
@@ -559,6 +1004,41 @@ class HudTest(unittest.TestCase):
         self.assertEqual(state["plan"][0]["status"], "pending")
         self.assertEqual(state["plan"][0]["step"], "未命名任务")
         self.assertEqual(state["plan_state"], "active")
+        self.assertEqual(state["current_plan"][0]["step"], "未命名任务")
+
+    def test_status_details_prints_plan_history_and_agent_sources(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        hud_state.reconcile_plan(
+            state,
+            [{"step": "Historical", "status": "completed"}],
+            revision=1,
+            turn_id="turn-1",
+            updated_at=10,
+        )
+        state["agents"] = {
+            "agent-1": {
+                "type": "reviewer",
+                "status": "running",
+                "started_at": 1,
+                "ended_at": None,
+                "description": "history review",
+                "model": "gpt-5.6-sol",
+                "current_activity": "testing",
+                "source_confidence": "hook+spawn",
+            }
+        }
+        hud_state.update_state(self.run_id, lambda current: current.update(state))
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            codex_hud_cli._print_run_status(self.run_id, details=True)
+
+        rendered = output.getvalue()
+        self.assertIn("history:", rendered)
+        self.assertIn("Historical", rendered)
+        self.assertIn("agents:", rendered)
+        self.assertIn("history review", rendered)
+        self.assertIn("source=hook+spawn", rendered)
 
     def test_small_geometry_preserves_todo_summary(self) -> None:
         state = hud_state.default_state(self.run_id)
