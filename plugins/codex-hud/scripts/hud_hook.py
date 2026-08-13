@@ -82,6 +82,9 @@ def _spawn_record(event: dict[str, Any], now: float) -> dict[str, Any] | None:
     if not description and task_name:
         description = sanitize_display_text(task_name.replace("_", " ").replace("-", " "), 120)
     model = sanitize_display_text(tool_input.get("model"), 80)
+    effort = sanitize_display_text(
+        tool_input.get("effort") or tool_input.get("reasoning_effort"), 20
+    )
     if not task_name and not description and not model:
         return None
     return {
@@ -89,6 +92,7 @@ def _spawn_record(event: dict[str, Any], now: float) -> dict[str, Any] | None:
         "task_name": task_name or None,
         "description": description or None,
         "model": model or None,
+        "effort": effort or None,
         "started_at": now,
         "updated_at": now,
         "current_activity": "starting",
@@ -269,6 +273,12 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
             if not description:
                 description = (spawn or {}).get("description")
             model = sanitize_display_text(event.get("model"), 80) or (spawn or {}).get("model")
+            effort = (
+                sanitize_display_text(
+                    event.get("effort") or event.get("reasoning_effort"), 20
+                )
+                or (spawn or {}).get("effort")
+            )
             source_confidence = "hook"
             if spawn:
                 source_confidence = "hook+spawn"
@@ -281,6 +291,7 @@ def handle_event(event: dict[str, Any], run_id: str) -> None:
                 "task_name": task_name,
                 "description": description,
                 "model": model or None,
+                "effort": effort or None,
                 "current_activity": "working",
                 "last_tool": None,
                 "updated_at": now,

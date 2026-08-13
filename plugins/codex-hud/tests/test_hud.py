@@ -25,6 +25,7 @@ import hud_render
 import hud_state
 import metrics
 import tmux_mouse
+import token_audit
 
 
 CLI_LOADER = importlib.machinery.SourceFileLoader("codex_hud_cli", str(SCRIPTS / "codex-hud"))
@@ -612,6 +613,152 @@ class HudTest(unittest.TestCase):
             hud_render.estimated_cost("gpt-5.6-sol", scanner.total), 4.4
         )
 
+    def test_token_audit_excludes_replayed_parent_history_from_subagent(self) -> None:
+        codex_home = Path(self.temporary.name) / "codex-home"
+        session_dir = codex_home / "sessions" / "2026" / "08" / "10"
+        session_dir.mkdir(parents=True)
+        root = session_dir / "root.jsonl"
+        root_records = [
+            {
+                "timestamp": "2026-08-10T01:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "root",
+                    "timestamp": "2026-08-10T01:00:00Z",
+                    "thread_source": "user",
+                    "model_provider": "openai",
+                    "source": "cli",
+                    "cwd": "/tmp/project",
+                },
+            },
+            {
+                "timestamp": "2026-08-10T01:00:00.500Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.6-sol", "effort": "high"},
+            },
+            {
+                "timestamp": "2026-08-10T01:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "total_tokens": 100,
+                            "input_tokens": 90,
+                            "cached_input_tokens": 40,
+                            "output_tokens": 10,
+                        }
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-08-10T01:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "view_image",
+                    "call_id": "call-1",
+                },
+            },
+            {
+                "timestamp": "2026-08-10T01:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                    ],
+                },
+            },
+            {
+                "timestamp": "2026-08-10T01:00:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "total_tokens": 250,
+                            "input_tokens": 230,
+                            "cached_input_tokens": 100,
+                            "output_tokens": 20,
+                        }
+                    },
+                },
+            },
+        ]
+        root.write_text(
+            "".join(json.dumps(record) + "\n" for record in root_records),
+            encoding="utf-8",
+        )
+
+        child = session_dir / "child.jsonl"
+        child_records = [
+            {
+                "timestamp": "2026-08-10T02:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "child",
+                    "timestamp": "2026-08-10T02:00:00Z",
+                    "thread_source": "subagent",
+                    "model_provider": "openai",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": "root",
+                                "depth": 1,
+                                "agent_path": "/root/audit",
+                            }
+                        }
+                    },
+                    "cwd": "/tmp/project",
+                },
+            },
+            *root_records,
+            {
+                "timestamp": "2026-08-10T02:00:01Z",
+                "type": "inter_agent_communication_metadata",
+                "payload": {"trigger_turn": True},
+            },
+            {
+                "timestamp": "2026-08-10T02:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "total_tokens": 300,
+                            "input_tokens": 275,
+                            "cached_input_tokens": 120,
+                            "output_tokens": 25,
+                        }
+                    },
+                },
+            },
+        ]
+        child.write_text(
+            "".join(json.dumps(record) + "\n" for record in child_records),
+            encoding="utf-8",
+        )
+
+        start = token_audit._parse_timestamp("2026-08-10T00:00:00Z")
+        end = token_audit._parse_timestamp("2026-08-11T00:00:00Z")
+        assert start is not None and end is not None
+        report = token_audit.build_report(codex_home, start=start, end=end)
+
+        self.assertEqual(report.usage["total_tokens"], 300)
+        self.assertEqual(report.usage["input_tokens"], 275)
+        self.assertEqual(report.sessions_with_usage, 2)
+        self.assertEqual(report.subagent_sessions, 1)
+        self.assertEqual(report.openai_quota["model_rounds"], 3)
+        self.assertEqual(report.task_families[0]["child_sessions"], 1)
+        self.assertEqual(report.task_families[0]["usage"]["total_tokens"], 300)
+        root_audit = next(item for item in report.top_sessions if item.session_id == "root")
+        child_audit = next(item for item in report.top_sessions if item.session_id == "child")
+        self.assertEqual(root_audit.image_blocks, 1)
+        self.assertEqual(root_audit.tool_breakdown["view_image"], 1)
+        self.assertEqual(child_audit.total_tokens, 50)
+
     def test_transcript_waits_for_complete_jsonl_line_and_resets_on_truncate(self) -> None:
         transcript = Path(self.temporary.name) / "partial.jsonl"
         record = json.dumps(
@@ -634,6 +781,114 @@ class HudTest(unittest.TestCase):
         transcript.write_text("", encoding="utf-8")
         scanner.scan(str(transcript))
         self.assertEqual(scanner.total, {})
+
+    def test_transcript_tracks_tool_payload_and_image_amplifiers(self) -> None:
+        transcript = Path(self.temporary.name) / "amplifiers.jsonl"
+        records = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "view_image",
+                    "call_id": "call-1",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                    ],
+                },
+            },
+            {
+                "type": "compacted",
+                "payload": {"window_number": 2},
+            },
+        ]
+        transcript.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        scanner = hud_render.TranscriptScanner()
+        scanner.scan(str(transcript))
+        self.assertEqual(scanner.tool_calls, 1)
+        self.assertEqual(scanner.tool_outputs, 1)
+        self.assertEqual(scanner.image_blocks, 1)
+        self.assertGreater(scanner.tool_output_bytes, 0)
+        self.assertEqual(scanner.compactions, 1)
+
+    def test_session_risk_escalates_for_context_amplifiers(self) -> None:
+        self.assertEqual(
+            metrics.session_risk(
+                4_999_999,
+                49,
+                19,
+                4_999_999,
+                1,
+                49,
+                99.9,
+                3600,
+            ).level,
+            "normal",
+        )
+        warning = metrics.session_risk(
+            5_000_000,
+            50,
+            20,
+            5_000_000,
+            2,
+            50,
+            100,
+            3600,
+        )
+        self.assertEqual(warning.level, "warning")
+        critical = metrics.session_risk(
+            20_000_000,
+            100,
+            100,
+            50_000_000,
+            3,
+            100,
+            250,
+            600,
+        )
+        self.assertEqual(critical.level, "critical")
+        self.assertIn("input>=20m", critical.reasons)
+        self.assertIn("credits>=250", critical.reasons)
+
+    def test_chatgpt_credit_estimate_matches_official_rate_card(self) -> None:
+        estimate = metrics.estimate_chatgpt_credits(
+            "gpt-5.6-sol",
+            {
+                "input_tokens": 23_264_350,
+                "cached_input_tokens": 22_866_688,
+                "output_tokens": 68_670,
+            },
+        )
+        self.assertIsNotNone(estimate)
+        assert estimate is not None
+        self.assertAlmostEqual(estimate.uncached_input, 49.70775, places=5)
+        self.assertAlmostEqual(estimate.cached_input, 285.8336, places=4)
+        self.assertAlmostEqual(estimate.output, 51.5025, places=4)
+        self.assertAlmostEqual(estimate.total, 387.04385, places=5)
+        self.assertIsNone(
+            metrics.estimate_chatgpt_credits("unknown-model", {"input_tokens": 1})
+        )
+
+    def test_update_refuses_active_hud_managed_task_before_mutation(self) -> None:
+        update_script = SCRIPTS.parents[2] / "scripts" / "update.sh"
+        result = subprocess.run(
+            ["bash", str(update_script)],
+            env={**os.environ, "CODEX_HUD_RUN_ID": "active-test-run"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Refusing to update", result.stderr)
 
     def test_transcript_extracts_agent_spawn_and_activity_metadata(self) -> None:
         transcript = Path(self.temporary.name) / "agents.jsonl"
@@ -910,10 +1165,11 @@ class HudTest(unittest.TestCase):
             {},
         )
 
-        self.assertIn("reviewer [gpt-5.6-sol]", lines[5])
-        self.assertIn("TODO history audit", lines[5])
-        self.assertIn("running tests", lines[5])
-        self.assertNotIn("\x1b]", lines[5])
+        self.assertIn("AGENTS 1 running", lines[5])
+        self.assertIn("reviewer [gpt-5.6-sol]", lines[6])
+        self.assertIn("TODO history audit", lines[6])
+        self.assertIn("running tests", lines[6])
+        self.assertNotIn("\x1b]", lines[6])
 
     def test_render_agents_keeps_recent_completed_agent_summary(self) -> None:
         state = hud_state.default_state(self.run_id)
@@ -937,7 +1193,7 @@ class HudTest(unittest.TestCase):
             {},
         )
 
-        self.assertIn("reviewer [gpt-5.6-sol] history review", lines[5])
+        self.assertIn("✓ 1 complete", lines[5])
 
     def test_completed_plan_renders_recent_completed_details(self) -> None:
         state = hud_state.default_state(self.run_id)
@@ -1056,20 +1312,29 @@ class HudTest(unittest.TestCase):
             {},
         )
 
-        visible = hud_render.fit_lines_for_geometry(lines, 7)
+        visible = hud_render.fit_lines_for_geometry(
+            lines, 7, agent_rows=0, detail_rows=1
+        )
         self.assertEqual(len(visible), 7)
         self.assertIn("TODO", "\n".join(visible))
         self.assertNotIn("Keep visible", "\n".join(visible))
 
     def test_partial_dynamic_geometry_keeps_summary_and_first_detail(self) -> None:
-        lines = [f"line-{index}" for index in range(8)] + ["detail-1", "detail-2"]
+        lines = [f"line-{index}" for index in range(6)]
+        lines += ["agent-1", "agent-2"]
+        lines += ["skills", "todo"]
+        lines += ["detail-1", "detail-2"]
 
-        visible = hud_render.fit_lines_for_geometry(lines, 9)
+        visible = hud_render.fit_lines_for_geometry(
+            lines, 9, agent_rows=2, detail_rows=2
+        )
 
-        self.assertEqual(visible, lines[:9])
-        self.assertEqual(visible.count("line-7"), 1)
-        self.assertIn("detail-1", visible)
-        self.assertNotIn("detail-2", visible)
+        self.assertEqual(len(visible), 9)
+        self.assertIn("todo", visible)
+        self.assertIn("skills", visible)
+        self.assertIn("agent-1", visible)
+        self.assertNotIn("agent-2", visible)
+        self.assertNotIn("detail-1", visible)
 
     def test_plan_detail_preserves_overflow_suffix_when_clipped(self) -> None:
         item = {"step": "B" * 240, "status": "pending"}
@@ -1179,6 +1444,47 @@ class HudTest(unittest.TestCase):
         self.assertIn("API equiv.$2.20", output)
         self.assertIn("API in 200k + cache 800k · out 100k · reasoning 25k", output)
         self.assertNotIn("primary", output)
+
+    def test_render_marks_live_context_amplification_risk(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update({"cwd": self.temporary.name, "model": "gpt-5.6-sol"})
+        scanner = hud_render.TranscriptScanner()
+        scanner.total = {
+            "input_tokens": 120_000_000,
+            "cached_input_tokens": 110_000_000,
+            "output_tokens": 250_000,
+        }
+        scanner.tool_outputs = 1_100
+        scanner.image_blocks = 120
+        scanner.tool_output_bytes = 60_000_000
+        lines = hud_render.render_lines(state, scanner, {"type": "chatgpt"}, {})
+        output = "\n".join(lines)
+        self.assertIn("IO 1100t/120img", output)
+        self.assertIn("critical", output)
+
+    def test_render_separates_openai_chatgpt_quota_from_custom_provider(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state.update({"cwd": self.temporary.name, "model": "gpt-5.6-sol"})
+        scanner = hud_render.TranscriptScanner()
+        scanner.model = "gpt-5.6-sol"
+        scanner.total = {
+            "input_tokens": 23_264_350,
+            "cached_input_tokens": 22_866_688,
+            "output_tokens": 68_670,
+        }
+
+        scanner.model_provider = "openai"
+        openai_output = "\n".join(
+            hud_render.render_lines(state, scanner, {"type": "chatgpt"}, {})
+        )
+        self.assertIn("≈387.0cr quota", openai_output)
+
+        scanner.model_provider = "custom"
+        custom_output = "\n".join(
+            hud_render.render_lines(state, scanner, {"type": "chatgpt"}, {})
+        )
+        self.assertIn("≈quota --", custom_output)
+        self.assertNotIn("cr quota", custom_output)
 
     def test_context_matches_codex_0146_native_tui(self) -> None:
         usage = metrics.official_context_usage(122_880, 258_400)
@@ -2232,6 +2538,191 @@ class HudTest(unittest.TestCase):
         # 134772/258400 ≈ 52.16%, rounded remaining = 48, used = 52
         self.assertEqual(usage.used_percent, 52)
         self.assertEqual(usage.remaining_percent, 48)
+
+
+    def test_spawn_hook_captures_effort_without_prompt_body(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-1",
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-1",
+                "tool_input": {
+                    "task_name": "review",
+                    "model": "gpt-5.6-sol",
+                    "effort": "high",
+                    "message": "secret prompt must not be stored",
+                },
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "thread-1",
+                "agent_id": "agent-1",
+                "agent_type": "reviewer",
+            },
+            self.run_id,
+        )
+
+        agent = hud_state.load_state(self.run_id)["agents"]["agent-1"]
+        self.assertEqual(agent["effort"], "high")
+        self.assertNotIn("secret prompt", json.dumps(hud_state.load_state(self.run_id)))
+
+    def test_subagent_start_captures_reasoning_effort_alias(self) -> None:
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "thread-1",
+                "source": "startup",
+            },
+            self.run_id,
+        )
+        hud_hook.handle_event(
+            {
+                "hook_event_name": "SubagentStart",
+                "session_id": "thread-1",
+                "agent_id": "agent-1",
+                "agent_type": "explorer",
+                "reasoning_effort": "medium",
+            },
+            self.run_id,
+        )
+
+        agent = hud_state.load_state(self.run_id)["agents"]["agent-1"]
+        self.assertEqual(agent["effort"], "medium")
+
+    def test_transcript_extracts_agent_effort(self) -> None:
+        transcript = Path(self.temporary.name) / "effort.jsonl"
+        transcript.write_text(
+            "".join(
+                json.dumps(record) + "\n"
+                for record in [
+                    {
+                        "timestamp": "2026-08-08T10:00:00Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "spawn_agent",
+                            "call_id": "call-1",
+                            "arguments": json.dumps(
+                                {
+                                    "task_name": "audit",
+                                    "model": "gpt-5.6-sol",
+                                    "effort": "high",
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "timestamp": "2026-08-08T10:00:01Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call-1",
+                            "output": json.dumps({"task_name": "/root/audit"}),
+                        },
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        scanner = hud_render.TranscriptScanner()
+        scanner.scan(str(transcript))
+
+        self.assertEqual(scanner.agent_metadata["/root/audit"]["effort"], "high")
+
+    def test_render_agents_expands_one_row_per_running_agent(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        state["agents"] = {
+            "a": {
+                "type": "reviewer",
+                "status": "running",
+                "started_at": time.time() - 10,
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "description": "review PR",
+            },
+            "b": {
+                "type": "explorer",
+                "status": "running",
+                "started_at": time.time() - 5,
+                "model": "gpt-5.6-terra",
+                "effort": "low",
+                "description": "map repo",
+            },
+        }
+
+        lines = hud_render.render_lines(
+            state, hud_render.TranscriptScanner(), {}, {}
+        )
+
+        self.assertIn("AGENTS 2 running", lines[5])
+        self.assertIn("explorer [gpt-5.6-terra · low]", lines[6])
+        self.assertIn("reviewer [gpt-5.6-sol · high]", lines[7])
+
+    def test_desired_hud_lines_grows_with_running_agents(self) -> None:
+        state = hud_state.default_state(self.run_id)
+        self.assertEqual(hud_state.desired_hud_lines(state), 8)
+        state["agents"] = {
+            str(index): {"status": "running", "started_at": index}
+            for index in range(3)
+        }
+        self.assertEqual(hud_state.desired_hud_lines(state), 11)
+        state["agents"] = {
+            str(index): {"status": "running", "started_at": index}
+            for index in range(20)
+        }
+        self.assertEqual(hud_state.desired_hud_lines(state), hud_state.HUD_MAX_LINES)
+
+    def test_theme_overrides_from_config(self) -> None:
+        self.assertEqual(hud_state.load_theme()["section_ctx"], "blue")
+        config = hud_state.config_path()
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "theme": {"section_ctx": "red", "effort_high": "magenta"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        theme = hud_state.load_theme()
+        self.assertEqual(theme["section_ctx"], "red")
+        self.assertEqual(theme["effort_high"], "magenta")
+        self.assertEqual(theme["section_hud"], "cyan")
+
+        config.write_text(
+            json.dumps({"enabled": True, "theme": {"section_ctx": "not-a-color"}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(hud_state.load_theme()["section_ctx"], "blue")
+
+    def test_color_uses_theme_slot_and_honors_no_color(self) -> None:
+        hud_render.refresh_theme()
+        os.environ.pop("NO_COLOR", None)
+        try:
+            self.assertIn("\x1b[34m", hud_render.color("section_ctx", "X"))
+            self.assertIn("\x1b[31m", hud_render.color("effort_max", "X"))
+        finally:
+            os.environ["NO_COLOR"] = "1"
+        self.assertEqual(hud_render.color("section_ctx", "X"), "X")
+
+    def test_effort_slot_maps_levels(self) -> None:
+        self.assertEqual(hud_render.effort_slot("low"), "effort_low")
+        self.assertEqual(hud_render.effort_slot("high"), "effort_high")
+        self.assertEqual(hud_render.effort_slot("max"), "effort_max")
+        self.assertEqual(hud_render.effort_slot("unrecognized"), "effort_medium")
 
 
 if __name__ == "__main__":

@@ -22,31 +22,37 @@ from pathlib import Path
 from typing import Any
 
 from hud_state import (
+    BASE_COLORS,
+    DEFAULT_THEME,
+    HUD_DETAIL_ROWS,
     HUD_MAX_LINES,
     HUD_MIN_LINES,
     HUD_VERSION,
     desired_hud_lines,
     enabled,
     load_state,
+    load_theme,
     plan_detail_items,
     plan_projection,
     recent_completed_items,
+    running_agent_count,
     sanitize_display_text,
+    todo_detail_rows,
 )
-from metrics import official_context_usage
+from metrics import estimate_chatgpt_credits, official_context_usage, session_risk
 
 
 ESC = "\033["
 RESET = f"{ESC}0m"
-COLORS = {
-    "cyan": f"{ESC}36m",
-    "green": f"{ESC}32m",
-    "yellow": f"{ESC}33m",
-    "red": f"{ESC}31m",
-    "magenta": f"{ESC}35m",
-    "dim": f"{ESC}2m",
-}
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+_theme: dict[str, str] = dict(DEFAULT_THEME)
+
+
+def refresh_theme() -> None:
+    """Reload config.json theme overrides at the start of each render frame."""
+    global _theme
+    _theme = load_theme()
 GIT_CACHE_SECONDS = 5.0
 _GIT_CACHE: dict[str, tuple[float, str]] = {}
 ACCOUNT_REFRESH_SECONDS = 60.0
@@ -123,10 +129,11 @@ def _touch_private(path: Path) -> None:
         pass
 
 
-def color(name: str, text: str) -> str:
+def color(slot: str, text: str) -> str:
     if os.environ.get("NO_COLOR"):
         return text
-    return f"{COLORS[name]}{text}{RESET}"
+    name = _theme.get(slot, slot)
+    return f"{ESC}{BASE_COLORS.get(name, name)}m{text}{RESET}"
 
 
 def human_tokens(value: int | float | None) -> str:
@@ -136,6 +143,15 @@ def human_tokens(value: int | float | None) -> str:
     if number >= 1_000:
         return f"{number / 1_000:.1f}".rstrip("0").rstrip(".") + "k"
     return str(int(number))
+
+
+def human_bytes(value: int | float | None) -> str:
+    number = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if number < 1024 or unit == "GB":
+            return f"{number:.1f}{unit}" if unit != "B" else f"{int(number)}B"
+        number /= 1024
+    return f"{int(value or 0)}B"
 
 
 def human_duration(seconds: float | int | None) -> str:
@@ -149,11 +165,19 @@ def human_duration(seconds: float | int | None) -> str:
     return f"{secs}s"
 
 
+def _percent_slot(value: float | int | None) -> str:
+    number = float(value or 0)
+    if number < 65:
+        return "progress_low"
+    if number < 85:
+        return "progress_mid"
+    return "progress_high"
+
+
 def progress_bar(percent: float | int | None, width: int = 10) -> str:
     value = max(0.0, min(100.0, float(percent or 0)))
     filled = round(width * value / 100)
-    name = "green" if value < 65 else "yellow" if value < 85 else "red"
-    return color(name, "█" * filled + "░" * (width - filled))
+    return color(_percent_slot(value), "█" * filled + "░" * (width - filled))
 
 
 def visible_clip(text: str, width: int) -> str:
@@ -210,7 +234,7 @@ def task_detail_line(
 ) -> str:
     status = item.get("status")
     marker = "◐" if status == "in_progress" else "?" if status == "unknown" else "✓" if status == "completed" else "○"
-    marker_color = "green" if status == "completed" else "yellow"
+    marker_color = "task_completed" if status == "completed" else "task_active"
     prefix = f"       {color(marker_color, marker)} "
     suffix = f"  … +{overflow}" if overflow > 0 else ""
     available = max(1, width - _visible_width(prefix) - _visible_width(suffix))
@@ -218,19 +242,76 @@ def task_detail_line(
     return prefix + visible_clip(step, available) + suffix
 
 
-def fit_lines_for_geometry(lines: list[str], rows: int) -> list[str]:
-    """Keep the TODO summary visible when a surface is temporarily too short."""
+def effort_slot(effort: Any) -> str:
+    """Map a reasoning-effort value to a theme slot for coloring."""
+    normalized = str(effort or "").strip().lower()
+    if normalized in {"low", "minimal", "0", "1"}:
+        return "effort_low"
+    if normalized in {"high", "2", "3"}:
+        return "effort_high"
+    if normalized in {"xhigh", "extreme", "max", "4", "5"}:
+        return "effort_max"
+    return "effort_medium"
+
+
+def _agent_detail_line(agent: dict[str, Any], started: float, now: float) -> str:
+    """Render one running agent on its own line."""
+    agent_type = sanitize_display_text(agent.get("type"), 40) or "agent"
+    model = sanitize_display_text(agent.get("model"), 80)
+    effort = sanitize_display_text(agent.get("effort"), 20)
+    description = sanitize_display_text(agent.get("description"), 80)
+    activity = sanitize_display_text(agent.get("current_activity"), 40)
+    parts = [color("agent_running", f"◐ {agent_type}")]
+    model_effort = model or ""
+    if effort:
+        model_effort += f" · {color(effort_slot(effort), effort)}"
+    if model_effort:
+        parts.append(color("model", f"[{model_effort}]"))
+    if description:
+        parts.append(description)
+    if activity and activity not in {"working", "starting", "spawned"}:
+        parts.append(color("task_active", f"· {activity}"))
+    parts.append(human_duration(now - started))
+    return "  " + " ".join(parts)
+
+
+def fit_lines_for_geometry(
+    lines: list[str],
+    rows: int,
+    *,
+    agent_rows: int = 0,
+    detail_rows: int = 0,
+) -> list[str]:
+    """Clip a full frame to a short surface without hiding summary rows.
+
+    The six fixed header rows always survive. When space is scarce, the TODO
+    summary and SKILLS rows are kept first, then running-agent rows, and finally
+    TODO detail rows — so TODO detail rows drop before running-agent rows.
+    """
     target = max(1, int(rows))
     if len(lines) <= target:
         return lines
-    todo_index = 7 if len(lines) > 7 else len(lines) - 1
-    if target > todo_index:
-        # The summary already fits. Keep as many detail rows as the observed
-        # surface can hold instead of appending the summary a second time.
-        return lines[:target]
-    if target == 1:
-        return [lines[todo_index]]
-    return [*lines[: target - 1], lines[todo_index]]
+    if target <= 6:
+        return lines[:6][:target]
+
+    skills_index = 6 + agent_rows
+    todo_index = skills_index + 1
+    detail_start = todo_index + 1
+
+    priority: list[int] = []
+    if todo_index < len(lines):
+        priority.append(todo_index)
+    if skills_index < len(lines):
+        priority.append(skills_index)
+    priority.extend(range(6, min(6 + agent_rows, len(lines))))
+    priority.extend(range(detail_start, min(detail_start + detail_rows, len(lines))))
+
+    kept = set(range(6))
+    for index in priority:
+        if len(kept) >= target:
+            break
+        kept.add(index)
+    return [lines[index] for index in sorted(kept)]
 
 
 def format_reset(timestamp: Any) -> str:
@@ -249,6 +330,22 @@ def format_window(minutes: Any) -> str:
     return f"{value}m" if value else "quota"
 
 
+def _json_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _count_image_blocks(value: Any) -> int:
+    if isinstance(value, dict):
+        count = 1 if value.get("type") in {"image", "input_image"} else 0
+        return count + sum(_count_image_blocks(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_count_image_blocks(item) for item in value)
+    return 0
+
+
 class TranscriptScanner:
     def __init__(self) -> None:
         self.path: Path | None = None
@@ -256,9 +353,16 @@ class TranscriptScanner:
         self.last: dict[str, Any] = {}
         self.total: dict[str, Any] = {}
         self.context_window: int | None = None
+        self.model_provider: str | None = None
         self.model: str | None = None
         self.effort: str | None = None
         self.rate_limits: dict[str, Any] = {}
+        self.token_updates = 0
+        self.tool_calls = 0
+        self.tool_outputs = 0
+        self.tool_output_bytes = 0
+        self.image_blocks = 0
+        self.compactions = 0
         self.agent_metadata: dict[str, dict[str, Any]] = {}
         self._pending_agent_spawns: dict[str, dict[str, Any]] = {}
 
@@ -267,9 +371,16 @@ class TranscriptScanner:
         self.last = {}
         self.total = {}
         self.context_window = None
+        self.model_provider = None
         self.model = None
         self.effort = None
         self.rate_limits = {}
+        self.token_updates = 0
+        self.tool_calls = 0
+        self.tool_outputs = 0
+        self.tool_output_bytes = 0
+        self.image_blocks = 0
+        self.compactions = 0
         self.agent_metadata = {}
         self._pending_agent_spawns = {}
 
@@ -309,6 +420,20 @@ class TranscriptScanner:
         payload = record.get("payload")
         if not isinstance(payload, dict):
             return
+        if record.get("type") == "compacted":
+            self.compactions += 1
+        elif record.get("type") == "response_item":
+            item_type = payload.get("type")
+            if item_type in {"function_call", "custom_tool_call"}:
+                self.tool_calls += 1
+            elif item_type in {"function_call_output", "custom_tool_call_output"}:
+                self.tool_outputs += 1
+                output = payload.get("output")
+                self.tool_output_bytes += _json_size(output)
+                self.image_blocks += _count_image_blocks(output)
+        model_provider = payload.get("model_provider")
+        if isinstance(model_provider, str):
+            self.model_provider = model_provider
         model = payload.get("model")
         if isinstance(model, str):
             self.model = model
@@ -326,6 +451,7 @@ class TranscriptScanner:
                 self.last = last
             if isinstance(total, dict):
                 self.total = total
+                self.token_updates += 1
             window = info.get("model_context_window")
             if isinstance(window, int):
                 self.context_window = window
@@ -352,12 +478,16 @@ class TranscriptScanner:
             if not task_name:
                 return
             model = sanitize_display_text(arguments.get("model"), 80)
+            effort = sanitize_display_text(
+                arguments.get("effort") or arguments.get("reasoning_effort"), 20
+            )
             self._pending_agent_spawns[str(payload.get("call_id") or "")] = {
                 "task_name": task_name,
                 "description": sanitize_display_text(
                     task_name.replace("_", " ").replace("-", " "), 120
                 ),
                 "model": model or None,
+                "effort": effort or None,
                 "updated_at": timestamp,
                 "current_activity": "starting",
             }
@@ -399,6 +529,11 @@ class TranscriptScanner:
             )
             metadata["current_activity"] = sanitize_display_text(payload.get("kind"), 40) or "active"
             metadata["updated_at"] = payload.get("occurred_at_ms") or timestamp
+            effort = sanitize_display_text(
+                payload.get("effort") or payload.get("reasoning_effort"), 20
+            )
+            if effort:
+                metadata["effort"] = effort
 
 
 class AccountReader:
@@ -678,23 +813,34 @@ def render_lines(
     duration = human_duration(now - float(state.get("started_at") or now))
     api_account = is_api_account(account)
     cost = estimated_cost(str(model).split(" · ", 1)[0], scanner.total)
-    cost_label = (
-        f"API equiv.${cost:.2f}" if cost is not None else "API equiv.$--"
+    credit_estimate = (
+        estimate_chatgpt_credits(str(model).split(" · ", 1)[0], scanner.total)
+        if not api_account and scanner.model_provider == "openai"
+        else None
     )
+    if api_account:
+        usage_label = f"API equiv.${cost:.2f}" if cost is not None else "API equiv.$--"
+    elif credit_estimate is not None:
+        usage_label = f"{credit_estimate.total:.1f}cr quota"
+    else:
+        usage_label = "quota --"
     status = str(state.get("status") or "starting")
-    status_mark = color("yellow", "●") if status == "working" else color("green", "●")
+    status_mark = (
+        color("status_working", "●") if status == "working"
+        else color("status_ready", "●")
+    )
     first = "  ".join(
         part
         for part in (
-            f"{color('cyan', 'HUD')} v{HUD_VERSION} {status_mark} {status}",
-            color("cyan", f"[{model}]"),
+            f"{color('section_hud', 'HUD')} v{HUD_VERSION} {status_mark} {status}",
+            color("model", f"[{model}]"),
             color(
-                "magenta",
+                "account",
                 f"acct:{account_label(account, loading=not account_loaded)}",
             ),
             f"{project} {branch}".strip(),
             f"⏱ {duration}",
-            f"≈{cost_label}",
+            f"≈{usage_label}",
         )
         if part
     )
@@ -706,32 +852,42 @@ def render_lines(
     quota_source = limits if limits else scanner.rate_limits
     primary = _quota_window(quota_source, "primary")
     secondary = _quota_window(quota_source, "secondary")
+    ctx_slot = _percent_slot(used_percent)
     if context:
         second = (
-            f"{color('cyan', 'CTX')}  {progress_bar(used_percent)}  "
-            f"{used_percent}% used · {context.remaining_percent}% left · "
+            f"{color('section_ctx', 'CTX')}  {progress_bar(used_percent)}  "
+            f"{color(ctx_slot, f'{used_percent}%')} used · "
+            f"{context.remaining_percent}% left · "
             f"{human_tokens(context.used_tokens)}/{human_tokens(context.window_tokens)}"
         )
     else:
-        second = f"{color('cyan', 'CTX')}  {progress_bar(0)}  --"
+        second = f"{color('section_ctx', 'CTX')}  {progress_bar(0)}  --"
     if primary:
+        primary_used = float(_field(primary, 'usedPercent', 'used_percent') or 0)
         second += (
             f"  │  {format_window(_field(primary, 'windowDurationMins', 'window_minutes'))} "
-            f"{float(_field(primary, 'usedPercent', 'used_percent') or 0):.0f}% "
+            f"{color(_percent_slot(primary_used), f'{primary_used:.0f}%')} "
             f"↻{format_reset(_field(primary, 'resetsAt', 'resets_at'))}"
         )
     if secondary:
+        secondary_used = float(_field(secondary, 'usedPercent', 'used_percent') or 0)
         second += (
             f"  │  {format_window(_field(secondary, 'windowDurationMins', 'window_minutes'))} "
-            f"{float(_field(secondary, 'usedPercent', 'used_percent') or 0):.0f}% "
+            f"{color(_percent_slot(secondary_used), f'{secondary_used:.0f}%')} "
             f"↻{format_reset(_field(secondary, 'resetsAt', 'resets_at'))}"
         )
 
     input_tokens = int(scanner.total.get("input_tokens") or 0)
     cached_tokens = int(scanner.total.get("cached_input_tokens") or 0)
     cache_percent = cached_tokens * 100 / input_tokens if input_tokens else 0
+    cache_slot = (
+        "metric_bad" if cache_percent < 40
+        else "metric_warn" if cache_percent < 70
+        else "metric_good"
+    )
     third = (
-        f"{color('cyan', 'CACHE')} {cache_percent:.0f}% · "
+        f"{color('section_cache', 'CACHE')} "
+        f"{color(cache_slot, f'{cache_percent:.0f}%')} · "
         f"{human_tokens(cached_tokens)}/{human_tokens(input_tokens)}"
     )
     if api_account:
@@ -764,12 +920,12 @@ def render_lines(
     for item in sorted_active_tools[:3]:
         elapsed = now - float(item.get("started_at") or now)
         active_tool_parts.append(
-            color("yellow", f"◐ {item.get('name', 'tool')} {human_duration(elapsed)}")
+            color("task_active", f"◐ {item.get('name', 'tool')} {human_duration(elapsed)}")
         )
     active_overflow = len(sorted_active_tools) - 3
     if active_overflow > 0:
         active_tool_parts.append(f"… +{active_overflow} more")
-    fourth = f"{color('cyan', 'TOOLS')}  " + (
+    fourth = f"{color('section_tools', 'TOOLS')}  " + (
         " · ".join(active_tool_parts) if active_tool_parts else "--"
     )
 
@@ -789,9 +945,37 @@ def render_lines(
     )
 
     agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    running_agents = sum(
+        isinstance(agent, dict) and agent.get("status") == "running"
+        for agent in agents.values()
+    )
+    risk = session_risk(
+        input_tokens,
+        scanner.tool_outputs,
+        scanner.image_blocks,
+        scanner.tool_output_bytes,
+        running_agents,
+        scanner.token_updates,
+        credit_estimate.total if credit_estimate is not None else None,
+        now - float(state.get("started_at") or now),
+    )
+    if (
+        scanner.token_updates
+        or scanner.tool_outputs
+        or scanner.image_blocks
+        or scanner.tool_output_bytes
+    ):
+        third += (
+            f"  │  IO {scanner.tool_outputs}t/{scanner.image_blocks}img/"
+            f"{human_bytes(scanner.tool_output_bytes)} · {scanner.token_updates}r"
+        )
+    if risk.level != "normal":
+        risk_color = "risk_critical" if risk.level == "critical" else "risk_warning"
+        reason = risk.reasons[0] if risk.reasons else ""
+        label = f"⚠ {risk.level}:{reason}" if reason else f"⚠ {risk.level}"
+        third += f"  │  {color(risk_color, label)}"
     transcript_agents = scanner.agent_metadata
     running_agent_entries: list[tuple[float, str]] = []
-    recent_completed_agent_entries: list[tuple[float, str]] = []
     completed_agents = 0
     for agent_id, raw_agent in agents.items():
         agent = dict(raw_agent) if isinstance(raw_agent, dict) else {}
@@ -803,57 +987,23 @@ def render_lines(
                     metadata = candidate
                     break
         if metadata:
-            for key in ("description", "model", "current_activity", "updated_at"):
+            for key in ("description", "model", "effort", "current_activity", "updated_at"):
                 if metadata.get(key) is not None:
                     agent[key] = metadata[key]
         if not isinstance(agent, dict):
             continue
         if agent.get("status") == "running":
             started = float(agent.get("started_at") or now)
-            agent_type = sanitize_display_text(agent.get("type"), 40) or "agent"
-            model = sanitize_display_text(agent.get("model"), 80)
-            description = sanitize_display_text(agent.get("description"), 80)
-            activity = sanitize_display_text(agent.get("current_activity"), 40)
-            label_parts = [f"◐ {agent_type}"]
-            if model:
-                label_parts.append(f"[{model}]")
-            if description:
-                label_parts.append(description)
-            if activity and activity not in {"working", "starting", "spawned"}:
-                label_parts.append(f"· {activity}")
-            label = (
-                " ".join(label_parts) + f" {human_duration(now - started)}"
+            running_agent_entries.append(
+                (started, _agent_detail_line(agent, started, now))
             )
-            running_agent_entries.append((started, label))
         else:
             completed_agents += 1
-            ended = float(agent.get("ended_at") or agent.get("updated_at") or now)
-            agent_type = sanitize_display_text(agent.get("type"), 40) or "agent"
-            model = sanitize_display_text(agent.get("model"), 80)
-            description = sanitize_display_text(agent.get("description"), 60)
-            completed_label = f"✓ {agent_type}"
-            if model:
-                completed_label += f" [{model}]"
-            if description:
-                completed_label += f" {description}"
-            recent_completed_agent_entries.append((ended, completed_label))
     running_agent_entries.sort(key=lambda entry: entry[0], reverse=True)
-    recent_completed_agent_entries.sort(key=lambda entry: entry[0], reverse=True)
-    running_shown = min(2, len(running_agent_entries))
-    completed_shown = min(3 - running_shown, len(recent_completed_agent_entries))
-    agent_entries = [label for _, label in running_agent_entries[:running_shown]]
-    if len(agent_entries) < 3:
-        agent_entries.extend(
-            label for _, label in recent_completed_agent_entries[:completed_shown]
-        )
-    agent_summary = " · ".join(agent_entries) if agent_entries else "0 running"
-    agent_overflow = (len(running_agent_entries) - running_shown) + (
-        len(recent_completed_agent_entries) - completed_shown
-    )
-    if agent_overflow > 0:
-        agent_summary += f"  … +{agent_overflow} more"
+    agent_detail_lines = [line for _, line in running_agent_entries]
     sixth = (
-        f"{color('cyan', 'AGENTS')} {agent_summary} · ✓ {completed_agents} complete"
+        f"{color('section_agents', 'AGENTS')} {running_agents} running"
+        f" · {color('agent_completed', f'✓ {completed_agents} complete')}"
     )
 
     # SKILLS: filter active_tools and tool_stats for skill-related entries.
@@ -865,7 +1015,7 @@ def render_lines(
     for item in active_skills[:3]:
         elapsed = now - float(item.get("started_at") or now)
         skill_active_parts.append(
-            color("yellow", f"◐ {item.get('name', 'skill')} {human_duration(elapsed)}")
+            color("task_active", f"◐ {item.get('name', 'skill')} {human_duration(elapsed)}")
         )
     skill_active_overflow = len(active_skills) - 3
     if skill_active_overflow > 0:
@@ -885,7 +1035,7 @@ def render_lines(
     if skill_stat_overflow > 0:
         skill_stat_parts.append(f"… +{skill_stat_overflow} more")
     seventh_parts = skill_active_parts + skill_stat_parts
-    seventh = f"{color('cyan', 'SKILLS')} " + (
+    seventh = f"{color('section_skills', 'SKILLS')} " + (
         " · ".join(seventh_parts) if seventh_parts else "--"
     )
 
@@ -895,28 +1045,28 @@ def render_lines(
     unfinished = projection["unfinished"]
     recent_completed = recent_completed_items(state, limit=2)
     plan_state = str(state.get("plan_state") or "active")
-    eighth = f"{color('cyan', 'TODO')} {completed}/{len(plan)}"
+    eighth = f"{color('section_todo', 'TODO')} {completed}/{len(plan)}"
     if unfinished:
         eighth += f" · {len(unfinished)} 未完成"
         if plan_state == "stale":
-            eighth += f" · {color('yellow', '⚠ 计划未同步')}"
+            eighth += f" · {color('task_active', '⚠ 计划未同步')}"
         elif projection["in_progress"]:
-            eighth += f" · {color('yellow', '◐ 执行中')}"
+            eighth += f" · {color('task_active', '◐ 执行中')}"
         else:
-            eighth += f" · {color('yellow', '○ 待执行')}"
+            eighth += f" · {color('task_active', '○ 待执行')}"
         if recent_completed:
-            eighth += f" · {color('green', f'✓ 最近完成 {len(recent_completed)}')}"
+            eighth += f" · {color('task_completed', f'✓ 最近完成 {len(recent_completed)}')}"
     elif plan:
-        eighth += f"  {color('green', '✓ 全部完成')}"
+        eighth += f"  {color('task_completed', '✓ 全部完成')}"
         if recent_completed:
             eighth += f" · 最近完成 {len(recent_completed)}"
     elif recent_completed:
-        eighth += f" · {color('green', f'✓ 最近完成 {len(recent_completed)}')}"
+        eighth += f" · {color('task_completed', f'✓ 最近完成 {len(recent_completed)}')}"
     else:
         eighth += "  · --"
 
     detail_lines: list[str] = []
-    detail_items = plan_detail_items(state, limit=HUD_MAX_LINES - HUD_MIN_LINES)
+    detail_items = plan_detail_items(state, limit=HUD_DETAIL_ROWS)
     unfinished_shown = min(2, len(unfinished))
     for index, item in enumerate(detail_items):
         overflow = (
@@ -934,7 +1084,10 @@ def render_lines(
             )
         )
 
-    return [first, second, third, fourth, fifth, sixth, seventh, eighth, *detail_lines]
+    return [
+        first, second, third, fourth, fifth, sixth,
+        *agent_detail_lines, seventh, eighth, *detail_lines,
+    ]
 
 
 def main() -> int:
@@ -957,6 +1110,7 @@ def main() -> int:
     try:
         while enabled():
             state = load_state(args.run_id)
+            refresh_theme()
             # The launcher needs only a minimal first frame to open the split.
             # Defer a potentially large transcript scan until the HUD is
             # visible; --once remains a complete synchronous snapshot mode.
@@ -995,7 +1149,16 @@ def main() -> int:
             if args.geometry_file and geometry != last_geometry:
                 _write_private_json(Path(args.geometry_file), geometry)
                 last_geometry = geometry
-            visible_lines = lines if args.once else fit_lines_for_geometry(lines, geometry["rows"])
+            visible_lines = (
+                lines
+                if args.once
+                else fit_lines_for_geometry(
+                    lines,
+                    geometry["rows"],
+                    agent_rows=running_agent_count(state),
+                    detail_rows=todo_detail_rows(state),
+                )
+            )
             clipped = [visible_clip(line, width) for line in visible_lines]
             if args.once:
                 print("\n".join(clipped))

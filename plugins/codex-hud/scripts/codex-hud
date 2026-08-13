@@ -35,6 +35,7 @@ from tmux_mouse import (
     acquire_native_mouse as _acquire_native_mouse,
     release_native_mouse as _release_native_mouse,
 )
+from token_audit import main as token_audit_main
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1039,11 +1040,12 @@ def _print_run_status(run_id: str, details: bool = False) -> None:
                 description = sanitize_display_text(agent.get("description")) or "--"
                 activity = sanitize_display_text(agent.get("current_activity")) or "--"
                 model = sanitize_display_text(agent.get("model")) or "--"
+                effort = sanitize_display_text(agent.get("effort"), 20) or "--"
                 source = sanitize_display_text(agent.get("source_confidence"), 40) or "hook"
                 print(
                     f"- {sanitize_display_text(agent_id, 120)} "
                     f"{sanitize_display_text(agent.get('type'), 80) or 'agent'} "
-                    f"[{model}] {description} · {activity} "
+                    f"[{model} · {effort}] {description} · {activity} "
                     f"[{agent.get('status', 'unknown')}] source={source}"
                 )
 
@@ -1057,6 +1059,13 @@ def main() -> int:
     status_parser = subparsers.add_parser("status", help="显示 HUD 状态")
     status_parser.add_argument("--run-id")
     status_parser.add_argument("--details", action="store_true")
+    audit_parser = subparsers.add_parser("audit", help="只读审计 Codex token 消耗")
+    audit_parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME") or "~/.codex")
+    audit_parser.add_argument("--days", type=float, default=7.0)
+    audit_parser.add_argument("--since")
+    audit_parser.add_argument("--until")
+    audit_parser.add_argument("--top", type=int, default=10)
+    audit_parser.add_argument("--json", action="store_true", dest="as_json")
     run_parser = subparsers.add_parser("run", help="在 HUD 布局中启动 Codex")
     run_parser.add_argument("arguments", nargs=argparse.REMAINDER)
     internal = subparsers.add_parser("_run-main", help=argparse.SUPPRESS)
@@ -1089,6 +1098,22 @@ def main() -> int:
         if run_id:
             _print_run_status(run_id, details=args.details)
         return 0
+    if args.command == "audit":
+        audit_arguments = [
+            "--codex-home",
+            args.codex_home,
+            "--days",
+            str(args.days),
+            "--top",
+            str(args.top),
+        ]
+        if args.since:
+            audit_arguments.extend(["--since", args.since])
+        if args.until:
+            audit_arguments.extend(["--until", args.until])
+        if args.as_json:
+            audit_arguments.append("--json")
+        return token_audit_main(audit_arguments)
     if args.command == "run":
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return launch(arguments)

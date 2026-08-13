@@ -13,7 +13,7 @@ Codex HUD 已经是一个 Codex 插件，但插件和启动 wrapper 承担不同
 
 ## 路线
 
-Codex 原生 `tui.status_line` 继续负责单行信息；本插件按承载终端选择基础 8 行、计划/历史展开最多 11 行的侧车 surface：macOS standalone Ghostty 使用原生 split，已在 tmux 内或非 Ghostty 环境使用 tmux pane。外层 wrapper 为当前进程设置随机 `CODEX_HUD_RUN_ID`，只有带该 ID 的 Hook 才采集事件。首次 `SessionStart` 还会绑定当前 `CODEX_HOME` 指纹和 thread；不同 thread 的普通 `startup` 被拒绝，只有同账号下明确的 `clear` / `resume` 合法切换会迁移绑定。
+Codex 原生 `tui.status_line` 继续负责单行信息；本插件按承载终端选择基础 8 行、随运行中子代理与计划/历史动态扩展到最多 24 行的侧车 surface：macOS standalone Ghostty 使用原生 split，已在 tmux 内或非 Ghostty 环境使用 tmux pane。外层 wrapper 为当前进程设置随机 `CODEX_HUD_RUN_ID`，只有带该 ID 的 Hook 才采集事件。首次 `SessionStart` 还会绑定当前 `CODEX_HOME` 指纹和 thread；不同 thread 的普通 `startup` 被拒绝，只有同账号下明确的 `clear` / `resume` 合法切换会迁移绑定。
 
 ```text
 codex plugin add
@@ -36,16 +36,17 @@ codex plugin add
 - 状态文件采用文件锁和原子替换；Hook 异常被吞掉，监控不能阻塞 Codex。
 - Ghostty/macOS standalone 不创建 tmux 主 session；通过 Ghostty 原生 split 保持主 Codex surface 的滚轮、拖选、释放保持和右键原生语义。已在 tmux 内、非 Ghostty 或无法准确定位当前 Ghostty surface 时才使用 tmux fallback。
 - 原生 split 的 HUD surface 由 Ghostty 设置为 read-only；唯一的 OSC 7 working-directory marker 用于精确选择调用 wrapper 的 terminal，marker 不可用时安全回退，不猜测 front window。
-- 原生 split 的高度由 geometry monitor 按计划摘要和最近完成项动态校准到 8–11 行；tmux fallback 使用创建时的 `split-window -l 8`，renderer 在计划变化时调整自身 pane。
+- 原生 split 的高度由 geometry monitor 按运行中子代理、计划摘要和最近完成项动态校准，最多 24 行；tmux fallback 使用创建时的 `split-window -l 8`，renderer 在内容变化时调整自身 pane。
 - 不安装新的 server-global 鼠标绑定；升级时只识别带 `@is_hud` / `@hud_main_pane` 标记的旧版绑定，并恢复当前 tmux 默认命令。
 - pane 内的终端能力保持 `tmux-256color`，不把外层 Ghostty 的 `TERM=xterm-ghostty` 伪装传入 Codex。
 - HUD 包装路径使用 Codex 官方 `--no-alt-screen`，让 transcript 写入承载终端的 scrollback；普通无 HUD 启动不受影响。
 - Ghostty/macOS standalone 由 Ghostty 原生滚轮浏览历史；HUD renderer 不声明 mouse capture，也不注入鼠标协议。已在 tmux 内或非 Ghostty/非 macOS 才使用 tmux fallback。
 - 用户从独立 tmux session detach 时保留后台 Codex；只有 Codex 真正退出或布局启动失败才清理 session。
-- 最终渲染无尾随换行，surface 高度按计划摘要、最近完成项与实际 geometry 校准；空间不足时优先保留 TODO 汇总，避免滚屏。
-- `HUD_MIN_LINES`、`HUD_MAX_LINES` 和 `desired_hud_lines()` 在 `hud_state.py` 中定义为单一真源。
+- 最终渲染无尾随换行，surface 高度按运行中子代理、计划摘要、最近完成项与实际 geometry 动态校准；空间不足时优先保留 TODO 汇总，避免滚屏。
+- `HUD_MIN_LINES`、`HUD_MAX_LINES`、`HUD_DETAIL_ROWS` 和 `desired_hud_lines()` 在 `hud_state.py` 中定义为单一真源；高度随运行中子代理与 TODO 详情行动态增长。
 - `update_plan` 是 TODO 的唯一事实来源；当前计划与有上限的 `plan_history` 分离保存，任务按文本/顺序 best-effort 维持内部 ID，并记录状态转换和 revision。Stop/SessionEnd 不会自动完成未收尾任务，旧计划会显示为 stale/“计划未同步”。非法计划项保留为 unknown，不会伪装成完成。
-- `SubagentStart`/`SubagentStop` 决定 agent 生命周期；spawn Hook 和 transcript 只补充任务名、模型和最近动作。Hook 与 transcript 冲突时不改变生命周期，无法确认时降级显示类型和耗时。
+- `SubagentStart`/`SubagentStop` 决定 agent 生命周期；spawn Hook 和 transcript 只补充任务名、模型、推理强度和最近动作。推理强度容错探测 `effort`/`reasoning_effort`。Hook 与 transcript 冲突时不改变生命周期，无法确认时降级显示类型和耗时。
+- 主题使用语义槽位（`DEFAULT_THEME`），`color()` 按槽位解析到 `BASE_COLORS` 的 ANSI 码；`~/.codex-hud/config.json` 的 `theme` 区块可覆盖槽位，`NO_COLOR` 总开关保留。
 
 ## Context 口径
 

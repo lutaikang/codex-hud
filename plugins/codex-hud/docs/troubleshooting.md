@@ -10,6 +10,8 @@
 
 插件 Skill 可以执行 `on`、`off` 和 `status`，但不应在已运行的 Codex thread 内再启动交互式 `codex-hud run`。完整 HUD 需要在父 Codex 启动前注入 `--no-alt-screen` 和 `CODEX_HUD_RUN_ID`，嵌套会话也可能继承环境并干扰当前 thread 绑定。
 
+同样不要在 HUD 管理的活动任务内运行 `scripts/update.sh`。Codex 会把当前 Hook 解析为版本化缓存中的绝对路径；插件更新可能替换该缓存，而旧任务不会热加载新路径。更新脚本检测到 `CODEX_HUD_RUN_ID` 时会在任何文件变更前退出。请在外部终端更新，再新建任务。
+
 ## 鼠标滚轮、选区或右键异常
 
 Codex 0.146 的兼容问题来自 alternate screen 与 tmux 鼠标事件路径。HUD wrapper 会添加官方 `--no-alt-screen`，使历史输出进入承载终端的 scrollback；普通无 HUD 的 Codex 启动保持原配置。
@@ -24,7 +26,7 @@ Codex 0.146 的兼容问题来自 alternate screen 与 tmux 鼠标事件路径�
 
 ## 高度不正确
 
-tmux fallback 创建 HUD pane 时先用 `split-window -l 8` 分配基础高度；存在未完成任务或最近完成项时 renderer 会根据实际 pane 高度扩展到 9–11 行。Ghostty 原生 split 会读取实际 geometry 并动态校准。窗口过小时，HUD 会优先保留 TODO 汇总，额外任务行可能无法显示，但不会滚屏或启动失败。Ghostty renderer heartbeat 失效后，geometry monitor 会停止继续 resize。
+tmux fallback 创建 HUD pane 时先用 `split-window -l 8` 分配基础高度；存在运行中子代理、未完成任务或最近完成项时 renderer 会根据实际 pane 高度动态扩展到最多 24 行。Ghostty 原生 split 会读取实际 geometry 并动态校准。窗口过小时，HUD 会优先保留 TODO 汇总，额外任务行可能无法显示，但不会滚屏或启动失败。Ghostty renderer heartbeat 失效后，geometry monitor 会停止继续 resize。
 
 ## Context 与文档或旧版本不一致
 
@@ -40,7 +42,7 @@ tmux fallback 创建 HUD pane 时先用 `split-window -l 8` 分配基础高度�
 
 ## 嵌套 tmux
 
-在已有 tmux 内运行时，HUD 只分割当前 pane，不关闭现有 tmux status。终端高度不足基础 8 行时，tmux 可能拒绝创建 pane；高度不足 11 行时，TODO 详情会按实际空间降级为摘要或部分任务。高度暂时发生漂移时，renderer 会按实际 rows 再次校准。tmux 的 `mouse` 是 session 级选项，因此嵌入式 HUD 运行期间，同 session 的其他窗口可能暂时受到影响。
+在已有 tmux 内运行时，HUD 只分割当前 pane，不关闭现有 tmux status。终端高度不足基础 8 行时，tmux 可能拒绝创建 pane；空间不足时，HUD 优先保留 TODO 汇总，子代理与 TODO 详情行会按实际空间降级折叠。高度暂时发生漂移时，renderer 会按实际 rows 再次校准。tmux 的 `mouse` 是 session 级选项，因此嵌入式 HUD 运行期间，同 session 的其他窗口可能暂时受到影响。
 
 ## 账号或限额暂时显示未知
 

@@ -21,10 +21,15 @@ except ImportError:  # pragma: no cover - Windows fallback for future ports
 
 STATE_VERSION = 5
 HUD_MIN_LINES = 8
-HUD_MAX_LINES = 11
+# Dynamic height ceiling: the HUD grows to fit one row per running agent plus
+# TODO detail rows, but never beyond this many lines so a runaway fan-out does
+# not swallow the owning terminal.
+HUD_MAX_LINES = 24
 # Backward-compatible name used by the launcher and existing callers.
 HUD_LINES = HUD_MIN_LINES
-HUD_VERSION = "0.3.15"
+HUD_VERSION = "0.3.17"
+# TODO detail rows stay bounded even though the overall panel can grow.
+HUD_DETAIL_ROWS = 3
 KNOWN_PLAN_STATUSES = {"pending", "in_progress", "completed"}
 PLAN_HISTORY_LIMIT = 20
 PLAN_REVISION_LIMIT = 20
@@ -78,6 +83,7 @@ def normalize_agents(value: Any) -> dict[str, dict[str, Any]]:
                     "task_name": sanitize_display_text(raw_agent.get("task_name"), 80) or None,
                     "description": sanitize_display_text(raw_agent.get("description"), 120) or None,
                     "model": sanitize_display_text(raw_agent.get("model"), 80) or None,
+                    "effort": sanitize_display_text(raw_agent.get("effort"), 20) or None,
                     "current_activity": sanitize_display_text(raw_agent.get("current_activity"), 80) or None,
                     "last_tool": sanitize_display_text(raw_agent.get("last_tool"), 80) or None,
                     "updated_at": raw_agent.get("updated_at"),
@@ -343,10 +349,28 @@ def plan_state_for(plan: Any, *, stale: bool = False) -> str:
     return "stale" if stale else "active"
 
 
+def running_agent_count(state: dict[str, Any]) -> int:
+    agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    return sum(
+        isinstance(agent, dict) and agent.get("status") == "running"
+        for agent in agents.values()
+    )
+
+
+def todo_detail_rows(state: dict[str, Any]) -> int:
+    return len(plan_detail_items(state, limit=HUD_DETAIL_ROWS))
+
+
 def desired_hud_lines(state: dict[str, Any]) -> int:
-    """Return the surface height needed for the TODO detail rows."""
-    detail_rows = len(plan_detail_items(state, limit=HUD_MAX_LINES - HUD_MIN_LINES))
-    return min(HUD_MAX_LINES, HUD_MIN_LINES + detail_rows)
+    """Return the surface height for one row per running agent plus TODO detail.
+
+    The panel grows dynamically with the number of running agents and the TODO
+    detail rows, capped by HUD_MAX_LINES so a large fan-out cannot consume the
+    whole terminal.
+    """
+    agent_rows = running_agent_count(state)
+    detail_rows = todo_detail_rows(state)
+    return min(HUD_MAX_LINES, HUD_MIN_LINES + agent_rows + detail_rows)
 
 
 def hud_home() -> Path:
@@ -355,6 +379,66 @@ def hud_home() -> Path:
 
 def config_path() -> Path:
     return hud_home() / "config.json"
+
+
+BASE_COLORS = {
+    "black": "30", "red": "31", "green": "32", "yellow": "33",
+    "blue": "34", "magenta": "35", "cyan": "36", "white": "37",
+    "bright_black": "90", "bright_red": "91", "bright_green": "92",
+    "bright_yellow": "93", "bright_blue": "94", "bright_magenta": "95",
+    "bright_cyan": "96", "bright_white": "97",
+    "dim": "2", "bold": "1",
+}
+
+
+DEFAULT_THEME = {
+    "section_hud": "cyan",
+    "section_ctx": "blue",
+    "section_cache": "magenta",
+    "section_tools": "cyan",
+    "section_agents": "cyan",
+    "section_skills": "cyan",
+    "section_todo": "cyan",
+    "model": "cyan",
+    "account": "magenta",
+    "status_working": "yellow",
+    "status_ready": "green",
+    "progress_low": "green",
+    "progress_mid": "yellow",
+    "progress_high": "red",
+    "risk_warning": "yellow",
+    "risk_critical": "red",
+    "task_completed": "green",
+    "task_active": "yellow",
+    "agent_running": "yellow",
+    "agent_completed": "green",
+    "effort_low": "dim",
+    "effort_medium": "green",
+    "effort_high": "yellow",
+    "effort_xhigh": "red",
+    "effort_max": "red",
+    "metric_good": "green",
+    "metric_warn": "yellow",
+    "metric_bad": "red",
+}
+
+
+def load_theme() -> dict[str, str]:
+    """Merge config.json `theme` slot overrides onto the default theme."""
+    theme = dict(DEFAULT_THEME)
+    try:
+        value = json.loads(config_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return theme
+    if not isinstance(value, dict):
+        return theme
+    overrides = value.get("theme")
+    if not isinstance(overrides, dict):
+        return theme
+    for slot, name in overrides.items():
+        if isinstance(name, str) and name in BASE_COLORS:
+            theme[slot] = name
+    return theme
 
 
 def enabled() -> bool:
