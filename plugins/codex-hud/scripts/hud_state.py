@@ -27,7 +27,7 @@ HUD_MIN_LINES = 8
 HUD_MAX_LINES = 24
 # Backward-compatible name used by the launcher and existing callers.
 HUD_LINES = HUD_MIN_LINES
-HUD_VERSION = "0.3.17"
+HUD_VERSION = "0.3.18"
 # TODO detail rows stay bounded even though the overall panel can grow.
 HUD_DETAIL_ROWS = 3
 KNOWN_PLAN_STATUSES = {"pending", "in_progress", "completed"}

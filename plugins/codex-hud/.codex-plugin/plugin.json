@@ -1,6 +1,6 @@
 {
   "name": "codex-hud",
-  "version": "0.3.17+codex.20261014072552",
+  "version": "0.3.18+codex.20261015082659",
   "description": "Local dynamic HUD for the active Codex CLI session",
   "author": {
     "name": "Local developer"

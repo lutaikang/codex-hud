@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased - 2026-10-14
+## 0.3.18 - 2026-10-15
 
 - Keep HUD hooks in the launch environment with capability-gated `--no-daemon`
   on current Codex CLI; reject unsupported remote HUD sessions.
@@ -10,6 +10,16 @@
   including TERM/HUP, without stopping the shared Codex service.
 - Refuse plugin-cache updates from any Codex task or while Codex processes
   remain active; leave all existing sessions and hook trust untouched.
+
+## 0.3.17 - 2026-08-13
+
+- Show each running subagent on its own row with model and reasoning effort.
+  Missing effort degrades to type and elapsed time.
+- Add semantic theme slots that `config.json` can override, including section,
+  agent state, effort, and threshold colors.
+- Grow the HUD from 8 rows with running agents and TODO detail up to 24 rows.
+- Add read-only `codex-hud audit`, without counting replayed parent history
+  twice inside subagent sessions.
 
 ## 0.3.15 - 2026-08-10
 
