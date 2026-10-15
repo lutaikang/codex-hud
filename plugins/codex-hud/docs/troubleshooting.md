@@ -10,7 +10,7 @@
 
 插件 Skill 可以执行 `on`、`off` 和 `status`，但不应在已运行的 Codex thread 内再启动交互式 `codex-hud run`。完整 HUD 需要在父 Codex 启动前注入 `--no-alt-screen` 和 `CODEX_HUD_RUN_ID`，嵌套会话也可能继承环境并干扰当前 thread 绑定。
 
-同样不要在 HUD 管理的活动任务内运行 `scripts/update.sh`。Codex 会把当前 Hook 解析为版本化缓存中的绝对路径；插件更新可能替换该缓存，而旧任务不会热加载新路径。更新脚本检测到 `CODEX_HUD_RUN_ID` 时会在任何文件变更前退出。请在外部终端更新，再新建任务。
+同样不要在任何活动 Codex 任务内运行 `scripts/update.sh`。Codex 会把 Hook 解析为版本化缓存中的绝对路径；插件管理器删除旧缓存后，在途任务不会自动更换路径。更新脚本检查 `CODEX_HUD_RUN_ID`、`CODEX_THREAD_ID` 和活动 Codex 进程，在任何修改前拒绝更新，不会结束这些进程。请自行关闭共享该安装的任务和 App Server，再从外部终端更新，期间不要新开 Codex。只换到外部终端而保留其他活动任务仍不安全。
 
 ## 鼠标滚轮、选区或右键异常
 
@@ -28,11 +28,15 @@ Codex 0.146 的兼容问题来自 alternate screen 与 tmux 鼠标事件路径�
 
 tmux fallback 创建 HUD pane 时先用 `split-window -l 8` 分配基础高度；存在运行中子代理、未完成任务或最近完成项时 renderer 会根据实际 pane 高度动态扩展到最多 24 行。Ghostty 原生 split 会读取实际 geometry 并动态校准。窗口过小时，HUD 会优先保留 TODO 汇总，额外任务行可能无法显示，但不会滚屏或启动失败。Ghostty renderer heartbeat 失效后，geometry monitor 会停止继续 resize。
 
+## 面板一直停在 starting
+
+Codex CLI 0.162.1 默认复用共享服务，服务进程可能没有 wrapper 临时注入的运行 ID。新版 wrapper 在 CLI 支持时自动添加 `--no-daemon`，让 Hook 继承本次环境。请更新后在外部终端新开 `codex-hud run`。首次提交提示前还没有 SessionStart 状态时，`starting` 是正常的等待状态。
+
 ## Context 与文档或旧版本不一致
 
-当前实现不再扣除 12,000 token baseline，而是直接使用 transcript 的 raw `model_context_window` 和 `last_token_usage.total_tokens`。fixture `122880 / 258400` 的期望值是 `48% used`、`52% left`。
+当前实现从窗口与最新使用量都扣除 12,000 token baseline，与原生 TUI 口径一致。原始 fixture `122880 / 258400` 显示有效值 `110880 / 246400`，期望 `45% used`、`55% left`。旧版 baseline 为 0 时会高估原生已用比例。
 
-本次审计环境为 Codex CLI 0.147.0。运行 `./scripts/verify.sh` 检查 fixture；升级 Codex 后若口径变化，需要同步更新实现、测试和 `docs/metrics-semantics.md`。
+本次实际验证环境为 Codex CLI 0.162.1。运行 `./scripts/verify.sh` 检查 fixture；升级 Codex 后若口径变化，需要同步更新实现、测试和 `docs/metrics-semantics.md`。
 
 ## 账号错误
 

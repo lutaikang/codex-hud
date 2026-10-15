@@ -37,11 +37,13 @@ Codex 插件负责安装和启用 manifest、生命周期 Hook 与 `codex-hud` S
 
 终端布局必须在 Codex 启动前决定：wrapper 需要注入 `--no-alt-screen`、设置运行 ID，并成为 Ghostty split 或 tmux pane 的生命周期 owner。当前 Codex 插件接口没有 pre-launch wrapper 或多行 TUI surface 扩展点，所以普通 `codex` 不会自动创建 HUD。请在外部终端运行 `codex-hud run`，不要从已运行的 Codex thread 内启动嵌套交互会话。完整分析见 `docs/plugin-startup-analysis.md`。
 
+新版 CLI 支持 `--no-daemon` 时，wrapper 会自动注入该参数，让 Hook 使用当前启动环境中的运行 ID。旧 CLI 不添加此参数。启用 HUD 时不能使用 `--remote`，远端会话请用普通 `codex --remote ...`。
+
 ## 功能清单
 
 - 当前模型、推理强度、运行状态、项目、Git 分支和 Session 时长
 - 仅当前 `CODEX_HOME` 的当前账号与套餐
-- Context 已用/剩余比例（基于 Codex 原始值，与原生 TUI 口径一致）
+- Context 已用/剩余比例和有效 token 比（窗口与使用量都扣除 12,000 token，与原生 TUI 口径一致）
 - 当前账号的短周期和 7 天用量窗口（可用时）
 - 工具运行状态（最近 3 个活跃工具，按启动时间降序）
 - 工具累计调用统计（前 5 个，按调用次数降序 + 溢出提示）
@@ -57,7 +59,7 @@ Codex 插件负责安装和启用 manifest、生命周期 Hook 与 `codex-hud` S
 
 ## 前置条件
 
-- Codex CLI 0.146+（本次文档漂移审计使用 0.147.0）
+- Codex CLI 0.146+（本次实际运行验证使用 0.162.1）
 - Python 3.10+
 - tmux 3.x（仅已在 tmux 内或非 Ghostty/非 macOS fallback 需要）
 - macOS standalone Ghostty 可使用原生 split，不要求 tmux 承载主 Codex surface
@@ -80,7 +82,7 @@ codex plugin marketplace add /absolute/path/to/codex-hud
 codex plugin add codex-hud@codex-hud-local
 ```
 
-首次安装后，本地更新使用 `./scripts/update.sh`：它会写入单一 cachebuster 并重新安装。卸载见 `./scripts/uninstall.sh`；它不会删除 `~/.codex-hud` 中的本地偏好和临时状态。
+首次安装后，本地更新使用 `./scripts/update.sh`：先关闭 Codex 任务和 App Server，在外部终端执行，更新期间不要新开会话。脚本在任何修改前检查任务环境和活动 Codex 进程；不能确认空闲时拒绝，不会终止其他会话。通过后才写入 cachebuster 并重新安装。日常检查可独立运行 `./scripts/verify.sh`。卸载见 `./scripts/uninstall.sh`；它不会删除 `~/.codex-hud` 中的本地偏好和临时状态。
 
 ## 使用
 

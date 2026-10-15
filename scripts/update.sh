@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -n "${CODEX_HUD_RUN_ID:-}" ]]; then
-  echo "Refusing to update codex-hud from an active HUD-managed Codex task." >&2
-  echo "Run scripts/update.sh from an external terminal, then start a new Codex task." >&2
+if [[ -n "${CODEX_HUD_RUN_ID:-}" || -n "${CODEX_THREAD_ID:-}" ]]; then
+  echo "Refusing to update codex-hud from an active Codex task." >&2
+  echo "Use an external terminal after closing all Codex tasks and app servers." >&2
   exit 2
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 "$ROOT/scripts/check_update_idle.py"
 MANIFEST="$ROOT/plugins/codex-hud/.codex-plugin/plugin.json"
 BACKUP="$(mktemp)"
 cp "$MANIFEST" "$BACKUP"

@@ -75,7 +75,9 @@ scripts/verify.sh                   单测和校验
 
 插件安装本身已经成立：`codex plugin add` 会启用 manifest、Hook 和 Skill；但当前插件接口没有“在 Codex 父进程启动前包裹命令”或“向 TUI 注入多行区域”的入口。因此完整 HUD 采用“插件负责集成，wrapper 负责终端编排”的混合架构。
 
-Context 百分比基于 Codex 写入 transcript 的原始 `model_context_window` 和 `total_tokens` 值，与 Codex 原生 TUI 口径一致。成本始终标为 API 等价估算。
+Context 使用 Codex 原生 TUI 的有效窗口口径：从 transcript 的窗口和最新使用量中都扣除 12,000 token，再计算剩余比例；CTX 的 token 比也显示有效值。累计 token 保留原始值。详见 [指标语义](plugins/codex-hud/docs/metrics-semantics.md)。
+
+支持 `--no-daemon` 的 CLI 会在 HUD 启动时自动使用该参数，让 Hook 继承当前会话的运行 ID；复用既有共享服务可能让面板停在 `starting`。旧 CLI 保持原启动方式。HUD 不支持 `--remote` 会话，因为本地 Hook 无法绑定远端运行环境。
 
 HUD 包装路径为 Codex 注入官方 `--no-alt-screen`，让对话输出保留在承载终端的 scrollback；普通无 HUD 的 `codex` 不受影响。在 standalone Ghostty 中，主 Codex surface 不经过 tmux，滚轮、左键选区、释放保持和右键菜单全部由 Ghostty/Codex 原生处理；HUD surface 原生 read-only，并由 geometry monitor 动态校准到最多 24 行。已在 tmux 内时无法绕过外层 tmux，wrapper 保留兼容的 tmux mouse lease；非 Ghostty 或非 macOS 环境使用 tmux fallback，renderer 会在内容变化时调整 pane 高度。插件不安装 server-global 自定义鼠标绑定。
 
@@ -98,6 +100,8 @@ HUD 包装路径为 Codex 注入官方 `--no-alt-screen`，让对话输出保留
 
 发布或升级 Codex CLI 前，应重新核对 `plugins/codex-hud/docs/metrics-semantics.md` 中的版本敏感公式。
 
-本地修改插件后，请在 **HUD/Codex 任务之外的外部终端** 运行 `./scripts/update.sh`。更新脚本会拒绝带有 `CODEX_HUD_RUN_ID` 的活动任务，避免插件管理器替换缓存后，当前任务仍调用已经失效的绝对 Hook 路径。更新成功后请新开 Codex task，使 Hook 和 Skill 从新版本加载。
+本地修改插件后可随时运行 `./scripts/verify.sh`。重新安装请先关闭 Codex 任务和 App Server，再在外部终端运行 `./scripts/update.sh`；更新期间不要新开 Codex。插件管理器会删除旧版本缓存，单独换到外部终端不能保护仍运行的其他会话。
+
+更新脚本在任何文件修改前检查 `CODEX_HUD_RUN_ID`、`CODEX_THREAD_ID` 和活动 Codex 进程；发现活动会话或无法检查时直接拒绝，不终止进程、不修改信任。进程快照不能阻止随后新开的会话，因此仍需维护窗口。更新成功后新开任务加载新版 Hook 和 Skill。
 
 License: MIT

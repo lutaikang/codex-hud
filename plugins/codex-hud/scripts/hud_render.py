@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -537,35 +538,94 @@ class TranscriptScanner:
 
 
 class AccountReader:
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+        self._process_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+
+    def cancel(self) -> None:
+        """Stop this reader and reap only the app-server process it created."""
+        self._cancelled.set()
+        with self._process_lock:
+            process = self._process
+        if process is not None:
+            self._reap_process(process)
+
+    def _reap_process(self, process: subprocess.Popen[str]) -> None:
+        # Cancellation and read's finally can race. Serialize the full reap so
+        # neither caller returns while the other still owns a live child.
+        with self._cleanup_lock:
+            with self._process_lock:
+                if self._process is not process:
+                    return
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=1)
+            with self._process_lock:
+                if self._process is process:
+                    self._process = None
+
     def read(
         self, timeout: float = ACCOUNT_READ_TIMEOUT
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        try:
-            process = subprocess.Popen(
-                ["codex", "app-server"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
-            )
-        except OSError:
-            return {}, {}
+        with self._read_lock:
+            return self._read(timeout)
+
+    def _read(self, timeout: float) -> tuple[dict[str, Any], dict[str, Any]]:
+        with self._process_lock:
+            if self._cancelled.is_set():
+                return {}, {}
+            try:
+                process = subprocess.Popen(
+                    ["codex", "app-server"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError:
+                return {}, {}
+            self._process = process
         messages: queue.Queue[dict[str, Any]] = queue.Queue()
 
         def reader() -> None:
             assert process.stdout is not None
-            for line in process.stdout:
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(value, dict):
-                    messages.put(value)
+            try:
+                for line in process.stdout:
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(value, dict):
+                        messages.put(value)
+            finally:
+                # Only this thread closes its stream. Another process can keep
+                # an inherited stdout pipe open after the owned server exits.
+                close = getattr(process.stdout, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except OSError:
+                        pass
 
-        threading.Thread(target=reader, daemon=True).start()
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
 
         def send(value: dict[str, Any]) -> None:
+            if self._cancelled.is_set():
+                return
             assert process.stdin is not None
             process.stdin.write(json.dumps(value, separators=(",", ":")) + "\n")
             process.stdin.flush()
@@ -576,7 +636,7 @@ class AccountReader:
 
         def receive(expected_id: int) -> dict[str, Any] | None:
             """Return the first response for an id, including JSON-RPC errors."""
-            while time.monotonic() < deadline:
+            while not self._cancelled.is_set() and time.monotonic() < deadline:
                 remaining = max(0.01, deadline - time.monotonic())
                 try:
                     message = messages.get(timeout=min(0.05, remaining))
@@ -635,22 +695,16 @@ class AccountReader:
                     result = limits_response.get("result")
                     if isinstance(result, dict):
                         limits = result
-        except (BrokenPipeError, OSError, queue.Empty):
+        except (BrokenPipeError, OSError, ValueError, queue.Empty):
             pass
         finally:
-            try:
-                if process.stdin:
+            self._reap_process(process)
+            reader_thread.join(timeout=0.2)
+            if process.stdin:
+                try:
                     process.stdin.close()
-            except OSError:
-                pass
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
+                except OSError:
+                    pass
         return account, limits
 
 
@@ -700,9 +754,14 @@ class AccountPoller:
 
     def stop(self) -> None:
         self._stop.set()
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=0.2)
+        try:
+            cancel = getattr(self.reader, "cancel", None)
+            if callable(cancel):
+                cancel()
+        finally:
+            thread = self._thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=ACCOUNT_READ_TIMEOUT + 2)
 
 
 def account_label(account: dict[str, Any], loading: bool = False) -> str:
@@ -1101,13 +1160,24 @@ def main() -> int:
 
     scanner = TranscriptScanner()
     account_poller = None if args.once else AccountPoller()
-    if account_poller is not None:
-        account_poller.start()
+    previous_handlers: dict[int, Any] = {}
+    shutting_down = False
+
+    def terminate(signum: int, _frame: Any) -> None:
+        if not shutting_down:
+            raise SystemExit(128 + signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, terminate)
     last_geometry: dict[str, int] | None = None
     ready_written = False
     first_frame = True
 
     try:
+        if account_poller is not None:
+            account_poller.start()
         while enabled():
             state = load_state(args.run_id)
             refresh_theme()
@@ -1181,8 +1251,15 @@ def main() -> int:
             time.sleep(delay)
         return 0
     finally:
-        if account_poller is not None:
-            account_poller.stop()
+        shutting_down = True
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        try:
+            if account_poller is not None:
+                account_poller.stop()
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

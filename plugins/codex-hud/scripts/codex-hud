@@ -153,11 +153,34 @@ def _suspend_termination_handlers() -> None:
         signal.signal(signum, signal.SIG_IGN)
 
 
-def _codex_arguments(arguments: list[str]) -> list[str]:
+def _codex_supports_no_daemon() -> bool:
+    """Older CLIs run locally already and do not recognize --no-daemon."""
+    try:
+        result = subprocess.run(
+            ["codex", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (
+        result.returncode == 0
+        and isinstance(result.stdout, str)
+        and "--no-daemon" in result.stdout.split()
+    )
+
+
+def _codex_arguments(arguments: list[str], *, no_daemon: bool = False) -> list[str]:
     """Use Codex inline mode so the owning terminal retains transcript scrollback."""
-    if "--no-alt-screen" in arguments:
-        return list(arguments)
-    return ["--no-alt-screen", *arguments]
+    options = arguments[: arguments.index("--")] if "--" in arguments else arguments
+    prefix = [] if "--no-alt-screen" in options else ["--no-alt-screen"]
+    if no_daemon and "--no-daemon" not in options:
+        # A shared daemon predates this launch and cannot inherit the run ID
+        # that binds plugin hooks to this HUD surface.
+        prefix.append("--no-daemon")
+    return [*prefix, *arguments]
 
 
 def _native_terminal_mouse(environment: dict[str, str]) -> bool:
@@ -710,12 +733,20 @@ def launch(arguments: list[str]) -> int:
     if not enabled():
         return subprocess.call(["codex", *arguments])
 
+    options = arguments[: arguments.index("--")] if "--" in arguments else arguments
+    if any(option == "--remote" or option.startswith("--remote=") for option in options):
+        raise SystemExit(
+            "Codex HUD：本地 Hook 无法绑定远端会话。请使用普通 `codex --remote ...` 启动远端会话。"
+        )
+
     run_id = f"{int(time.time())}-{os.getpid()}-{secrets.token_hex(3)}"
     environment = os.environ.copy()
     hud_command = _tmux_command(
         [sys.executable, str(RENDERER), "--run-id", run_id], environment
     )
-    codex_arguments = _codex_arguments(arguments)
+    codex_arguments = _codex_arguments(
+        arguments, no_daemon=_codex_supports_no_daemon()
+    )
 
     if _native_ghostty_hud(environment):
         native_hud_command = _command_text(

@@ -40,6 +40,8 @@ codex plugin add
 - 不安装新的 server-global 鼠标绑定；升级时只识别带 `@is_hud` / `@hud_main_pane` 标记的旧版绑定，并恢复当前 tmux 默认命令。
 - pane 内的终端能力保持 `tmux-256color`，不把外层 Ghostty 的 `TERM=xterm-ghostty` 伪装传入 Codex。
 - HUD 包装路径使用 Codex 官方 `--no-alt-screen`，让 transcript 写入承载终端的 scrollback；普通无 HUD 启动不受影响。
+- wrapper 检测 CLI 的 `--no-daemon` 能力，支持时使用独立服务，避免既有共享服务缺少本次 `CODEX_HUD_RUN_ID`。旧 CLI 保持原路径；本地 HUD 拒绝无法绑定 Hook 的显式 `--remote` 会话。
+- renderer 退出时取消账号读取，并对自己创建的 App Server 执行 terminate/wait，必要时 kill/wait；TERM/HUP 也经过此清理路径，不操作共享服务。
 - Ghostty/macOS standalone 由 Ghostty 原生滚轮浏览历史；HUD renderer 不声明 mouse capture，也不注入鼠标协议。已在 tmux 内或非 Ghostty/非 macOS 才使用 tmux fallback。
 - 用户从独立 tmux session detach 时保留后台 Codex；只有 Codex 真正退出或布局启动失败才清理 session。
 - 最终渲染无尾随换行，surface 高度按运行中子代理、计划摘要、最近完成项与实际 geometry 动态校准；空间不足时优先保留 TODO 汇总，避免滚屏。
@@ -50,10 +52,10 @@ codex plugin add
 
 ## Context 口径
 
-Context 百分比直接使用 Codex transcript 中的 `model_context_window` 与 `last_token_usage.total_tokens`，当前 baseline 为 0。先计算剩余比例并按 Rust 非负数 `round()` 取整，再用 `100 - remaining_percent` 得到已用比例。
+Context 百分比从 Codex transcript 中的 `model_context_window` 与 `last_token_usage.total_tokens` 都扣除 12,000 token。先计算剩余比例并按 Rust 非负数 `round()` 取整，再用 `100 - remaining_percent` 得到已用比例。CTX token 比显示有效值；scanner 的原始值和累计 token 不改变。
 
 ## 兼容层
 
-`scripts/metrics.py` 隔离版本敏感指标。本次文档审计环境为 Codex CLI 0.147.0；Codex 升级后应同时核对 transcript 协议、原生 TUI 口径、测试 fixture 和 `docs/metrics-semantics.md`。
+`scripts/metrics.py` 隔离版本敏感指标。本次实际运行和官方协议核验环境为 Codex CLI 0.162.1；Codex 升级后应同时核对 transcript 协议、原生 TUI 口径、测试 fixture 和 `docs/metrics-semantics.md`。
 
 完整的插件原生启动可行性分析见 `docs/plugin-startup-analysis.md`。

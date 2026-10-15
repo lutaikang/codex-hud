@@ -2,11 +2,11 @@
 
 ## Context
 
-当前实现使用 Codex transcript 中的原始值，`OFFICIAL_BASELINE_TOKENS = 0`，不再扣除 12,000 token：
+当前实现复现 Codex CLI 0.162.1 的原生 TUI 计算，`OFFICIAL_BASELINE_TOKENS = 12000`。窗口和最新使用量都扣除固定 baseline：
 
 ```text
-effective_window = model_context_window
-effective_used   = max(last.total_tokens, 0)
+effective_window = max(model_context_window - 12000, 0)
+effective_used   = max(last.total_tokens - 12000, 0)
 remaining        = max(effective_window - effective_used, 0)
 remaining_pct    = round(remaining / effective_window * 100)
 used_pct         = 100 - remaining_pct
@@ -14,9 +14,9 @@ used_pct         = 100 - remaining_pct
 
 只有 transcript 尚未提供 `model_context_window` 时才显示未知。当 `effective_window == 0` 时，`remaining_pct = 0`，因此显示 `100% used`。
 
-实现按 Rust 非负数 `round()` 行为取整，并先计算剩余比例。当前回归 fixture `122880 / 258400` 必须保持原始 token 数，并得到 `48% used`、`52% left`。
+实现按 Rust 非负数 `round()` 行为取整，并先计算剩余比例。回归 fixture 的原始值 `122880 / 258400` 对应有效值 `110880 / 246400`，显示 `45% used`、`55% left`。本机真实会话的原始值 `35007 / 475000` 对应有效值 `23007 / 463000`，与原生状态栏同为 `5% used`。
 
-这部分是版本敏感兼容层。本次审计环境为 Codex CLI 0.147.0；升级 Codex 后若 transcript 或原生 TUI 口径变化，应同时更新 `scripts/metrics.py`、测试 fixture 和本文件，不能只改文档中的常量。
+CTX 的 token 比显示有效值；transcript scanner、缓存、累计 token 和成本计算仍保留原始值。官方依据是 [CLI 0.162.1 的 TokenUsage 计算](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/protocol/src/protocol.rs#L2448)。这部分是版本敏感兼容层；升级 Codex 后应同时核对 `scripts/metrics.py`、测试 fixture 和本文件。
 
 ## Cache
 

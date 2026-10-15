@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# HUD uses raw Codex values (baseline = 0) for a display that matches the
-# model's internal context budget. Versioned for test fixture compatibility.
-OFFICIAL_BASELINE_TOKENS = 0
+# Codex CLI 0.162.1 protocol TokenUsage::percent_of_context_window_remaining
+# subtracts this fixed baseline from both usage and the context window.
+# https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/protocol/src/protocol.rs
+OFFICIAL_BASELINE_TOKENS = 12_000
 
 # ChatGPT/Codex credits per 1M tokens. This is intentionally separate from
 # API-equivalent dollar pricing: subscription limits are consumed in credits.

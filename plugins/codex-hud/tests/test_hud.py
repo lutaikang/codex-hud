@@ -38,6 +38,13 @@ CLI_LOADER.exec_module(codex_hud_cli)
 class HudTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        # Existing launcher fixtures model the pre-daemon CLI. Modern CLI
+        # capability and argument routing are covered in test_launcher_daemon.
+        capability = mock.patch.object(
+            codex_hud_cli, "_codex_supports_no_daemon", return_value=False
+        )
+        capability.start()
+        self.addCleanup(capability.stop)
         os.environ["CODEX_HUD_HOME"] = self.temporary.name
         os.environ["NO_COLOR"] = "1"
         hud_state.set_enabled(True)
@@ -1486,14 +1493,14 @@ class HudTest(unittest.TestCase):
         self.assertIn("≈quota --", custom_output)
         self.assertNotIn("cr quota", custom_output)
 
-    def test_context_matches_codex_0146_native_tui(self) -> None:
+    def test_context_matches_codex_0162_native_tui(self) -> None:
         usage = metrics.official_context_usage(122_880, 258_400)
         self.assertIsNotNone(usage)
         assert usage is not None
-        self.assertEqual(usage.used_tokens, 122_880)
-        self.assertEqual(usage.window_tokens, 258_400)
-        self.assertEqual(usage.used_percent, 48)
-        self.assertEqual(usage.remaining_percent, 52)
+        self.assertEqual(usage.used_tokens, 110_880)
+        self.assertEqual(usage.window_tokens, 246_400)
+        self.assertEqual(usage.used_percent, 45)
+        self.assertEqual(usage.remaining_percent, 55)
 
     def test_context_rounds_remaining_like_rust(self) -> None:
         usage = metrics.official_context_usage(62, 112, baseline_tokens=0)
@@ -2528,9 +2535,9 @@ class HudTest(unittest.TestCase):
         bash_pos = tools_line.index("Bash")
         self.assertLess(write_pos, bash_pos)
 
-    def test_context_no_baseline_parity(self) -> None:
+    def test_explicit_zero_baseline_preserves_raw_values(self) -> None:
         """With baseline=0, used/window match the raw transcript values."""
-        usage = metrics.official_context_usage(134_772, 258_400)
+        usage = metrics.official_context_usage(134_772, 258_400, baseline_tokens=0)
         self.assertIsNotNone(usage)
         assert usage is not None
         self.assertEqual(usage.used_tokens, 134_772)

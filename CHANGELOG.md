@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased - 2026-10-14
+
+- Keep HUD hooks in the launch environment with capability-gated `--no-daemon`
+  on current Codex CLI; reject unsupported remote HUD sessions.
+- Restore the native TUI context baseline of 12,000 tokens, checked against
+  Codex CLI 0.162.1 and a real transcript/status-line pair.
+- Cancel and reap the owned account-query App Server on renderer shutdown,
+  including TERM/HUP, without stopping the shared Codex service.
+- Refuse plugin-cache updates from any Codex task or while Codex processes
+  remain active; leave all existing sessions and hook trust untouched.
+
 ## 0.3.15 - 2026-08-10
 
 - Preserve bounded per-session TODO history with stable internal task IDs,
