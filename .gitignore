@@ -21,6 +21,7 @@ build/
 
 # Codex / HUD runtime
 .codex-hud/
+.codex-task-state/
 *.lock
 *.ready
 *.exit
